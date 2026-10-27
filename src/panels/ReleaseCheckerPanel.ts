@@ -264,7 +264,7 @@ export class ReleaseCheckerPanel {
         break;
       case 'analyseReleases':
         await this.analyseReleases(
-          msg.promoteId as string,
+          msg.promoteIds as string[],
           msg.excludeIds as string[],
           msg.excludeNames as string[]
         );
@@ -346,10 +346,10 @@ export class ReleaseCheckerPanel {
 
   // ── Analyse two releases ────────────────────────────────────────────────────
 
-  private async analyseReleases(promoteId: string, excludeIds: string[], excludeNames: string[]): Promise<void> {
-    this.post({ type: 'status', message: 'Fetching stories for promote release…' });
+  private async analyseReleases(promoteIds: string[], excludeIds: string[], excludeNames: string[]): Promise<void> {
+    this.post({ type: 'status', message: `Fetching stories for ${promoteIds.length} release(s) to promote…` });
     try {
-      const promoteStories = this.fetchStoriesForRelease(promoteId);
+      const promoteStories = promoteIds.flatMap(id => this.fetchStoriesForRelease(id));
       const promoteMeta = this.fetchMetadataForStories(promoteStories.map(s => s.id));
 
       const allFutureStories: Story[] = [];
@@ -362,7 +362,7 @@ export class ReleaseCheckerPanel {
         allFutureMeta.push(...this.fetchMetadataForStories(stories.map(s => s.id)));
       }
 
-      this.post({ type: 'status', message: `Found ${promoteStories.length} stories in Promote, checking against ${allFutureStories.length} stories across ${excludeIds.length} future planned release(s). Fetching metadata…` });
+      this.post({ type: 'status', message: `Found ${promoteStories.length} stories across ${promoteIds.length} release(s) to promote, checking against ${allFutureStories.length} stories across ${excludeIds.length} future planned release(s). Fetching metadata…` });
 
       const common = this.findCommonComponents(promoteMeta, allFutureMeta, allFutureStories);
       this.post({ type: 'results', components: common, mode: 'release', orgInstanceUrl: this.orgInstanceUrl });
@@ -848,23 +848,36 @@ export class ReleaseCheckerPanel {
   <!-- Release Mode -->
   <div id="releaseMode">
     <div class="field">
-      <label>Release to Promote <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#a8b0d0">(approved — going to PREPROD)</span></label>
-      <select id="promoteRelease"><option value="">— Select release —</option></select>
-    </div>
-    <div class="field">
-      <label>Future Planned Releases <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#a8b0d0">(staying in UAT — metadata to flag as conflicts)</span></label>
+      <label>Releases to Promote</label>
       <div class="dual-listbox">
         <div class="listbox-col">
           <div class="listbox-col-label">Available</div>
-          <select id="availableReleases" multiple ondblclick="moveToSelected()"></select>
+          <select id="promoteAvailable" multiple ondblclick="moveReleases('promote', true)"></select>
         </div>
         <div class="listbox-arrows">
-          <button title="Add selected" onclick="moveToSelected()">▶</button>
-          <button title="Remove selected" onclick="moveToAvailable()">◀</button>
+          <button title="Add selected" onclick="moveReleases('promote', true)">▶</button>
+          <button title="Remove selected" onclick="moveReleases('promote', false)">◀</button>
+        </div>
+        <div class="listbox-col">
+          <div class="listbox-col-label">Releases to Promote</div>
+          <select id="promoteSelected" multiple ondblclick="moveReleases('promote', false)"></select>
+        </div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Future Planned Releases</label>
+      <div class="dual-listbox">
+        <div class="listbox-col">
+          <div class="listbox-col-label">Available</div>
+          <select id="futureAvailable" multiple ondblclick="moveReleases('future', true)"></select>
+        </div>
+        <div class="listbox-arrows">
+          <button title="Add selected" onclick="moveReleases('future', true)">▶</button>
+          <button title="Remove selected" onclick="moveReleases('future', false)">◀</button>
         </div>
         <div class="listbox-col">
           <div class="listbox-col-label">Future Planned Releases</div>
-          <select id="futureReleases" multiple ondblclick="moveToAvailable()"></select>
+          <select id="futureSelected" multiple ondblclick="moveReleases('future', false)"></select>
         </div>
       </div>
     </div>
@@ -929,31 +942,49 @@ export class ReleaseCheckerPanel {
     clearStatus();
   }
 
-  function moveToSelected() {
-    const left = document.getElementById('availableReleases');
-    const right = document.getElementById('futureReleases');
-    Array.from(left.selectedOptions).forEach(opt => right.appendChild(opt));
+  // A release can sit in only one of the two selected lists, so both pickers render from shared state.
+  let _releases = [];
+  const _picked = { promote: [], future: [] };
+
+  function releaseLabel(r) {
+    let label = r.name;
+    if (r.status) label += ' [' + r.status + ']';
+    if (r.storyCount > 0) label += ' — ' + r.storyCount + ' stor' + (r.storyCount === 1 ? 'y' : 'ies');
+    return label;
   }
 
-  function moveToAvailable() {
-    const left = document.getElementById('availableReleases');
-    const right = document.getElementById('futureReleases');
-    Array.from(right.selectedOptions).forEach(opt => left.appendChild(opt));
+  function fillSelect(id, list) {
+    document.getElementById(id).innerHTML = list.map(r => '<option value="' + esc(r.id) + '">' + esc(releaseLabel(r)) + '</option>').join('');
+  }
+
+  function renderReleasePickers() {
+    const taken = new Set([..._picked.promote, ..._picked.future]);
+    const free = _releases.filter(r => !taken.has(r.id));
+    const byId = id => _releases.find(r => r.id === id);
+    fillSelect('promoteAvailable', free);
+    fillSelect('futureAvailable', free);
+    fillSelect('promoteSelected', _picked.promote.map(byId));
+    fillSelect('futureSelected', _picked.future.map(byId));
+  }
+
+  function moveReleases(list, add) {
+    const from = document.getElementById(list + (add ? 'Available' : 'Selected'));
+    const ids = Array.from(from.selectedOptions).map(o => o.value);
+    if (!ids.length) return;
+    _picked[list] = add ? [..._picked[list], ...ids] : _picked[list].filter(id => !ids.includes(id));
+    renderReleasePickers();
   }
 
   function analyseReleases() {
-    const promoteId = document.getElementById('promoteRelease').value;
-    const futureSelect = document.getElementById('futureReleases');
-    const selectedOpts = Array.from(futureSelect.options).filter(o => o.value);
-    const excludeIds = selectedOpts.map(o => o.value);
-    const excludeNames = selectedOpts.map(o => o.text);
-    if (!promoteId) { showStatus('Please select a Release to Promote.', 'error'); return; }
-    if (excludeIds.length === 0) { showStatus('Please select at least one Future Planned Release.', 'error'); return; }
-    if (excludeIds.includes(promoteId)) { showStatus('The Promote release cannot also be a Future Planned Release.', 'error'); return; }
-    showStatus('Fetching stories and metadata for ' + excludeIds.length + ' future planned release(s)…', 'info', true);
+    const promoteIds = [..._picked.promote];
+    const excludeIds = [..._picked.future];
+    const nameOf = id => (_releases.find(r => r.id === id) || {}).name || id;
+    if (promoteIds.length === 0) { showStatus('Please add at least one Release to Promote.', 'error'); return; }
+    if (excludeIds.length === 0) { showStatus('Please add at least one Future Planned Release.', 'error'); return; }
+    showStatus('Fetching stories and metadata for ' + promoteIds.length + ' release(s) to promote and ' + excludeIds.length + ' future planned release(s)…', 'info', true);
     document.getElementById('resultsSection').style.display = 'none';
     document.getElementById('btnAnalyseReleases').disabled = true;
-    vscode.postMessage({ command: 'analyseReleases', promoteId, excludeIds, excludeNames });
+    vscode.postMessage({ command: 'analyseReleases', promoteIds, excludeIds, excludeNames: excludeIds.map(nameOf) });
   }
 
   function analyseStories() {
@@ -983,12 +1014,11 @@ export class ReleaseCheckerPanel {
     document.getElementById('componentList').innerHTML = '';
     // Clear status
     clearStatus();
-    // Reset release dropdowns
-    document.getElementById('promoteRelease').innerHTML = '<option value="">— Select release —</option>';
-    // Move all future-planned back to available
-    const left = document.getElementById('availableReleases');
-    const right = document.getElementById('futureReleases');
-    Array.from(right.options).forEach(opt => left.appendChild(opt));
+    // Clear both release pickers
+    _releases = [];
+    _picked.promote = [];
+    _picked.future = [];
+    renderReleasePickers();
     // Clear story inputs
     document.getElementById('story1Input').value = '';
     document.getElementById('story2Input').value = '';
@@ -1114,16 +1144,10 @@ export class ReleaseCheckerPanel {
       case 'releases': {
         _orgInstanceUrl = msg.orgInstanceUrl || '';
         document.getElementById('modeCard').style.display = 'block';
-        const opts = msg.releases.map(r => {
-          let label = esc(r.name);
-          if (r.status) label += ' [' + esc(r.status) + ']';
-          if (r.storyCount > 0) label += ' — ' + r.storyCount + ' stor' + (r.storyCount === 1 ? 'y' : 'ies');
-          return '<option value="' + esc(r.id) + '">' + label + '</option>';
-        }).join('');
-        const placeholder = '<option value="">— Select release —</option>';
-        document.getElementById('promoteRelease').innerHTML = placeholder + opts;
-        document.getElementById('availableReleases').innerHTML = opts;
-        document.getElementById('futureReleases').innerHTML = '';
+        _releases = msg.releases;
+        _picked.promote = [];
+        _picked.future = [];
+        renderReleasePickers();
         showStatus('Loaded ' + msg.releases.length + ' releases. Select releases and click Analyse.', 'success', false);
         break;
       }
