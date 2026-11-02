@@ -454,13 +454,55 @@ export class ReleaseCheckerPanel {
     const detected = saved || getDefaultSfOrg();
     this.orgAlias  = detected;
     const prefs = ReleaseCheckerPanel.context?.globalState.get<SavedPrefs>('savedPrefs') ?? {};
-    this.panel.webview.html = this.getHtml(detected, prefs);
+    this.panel.webview.html = this.getHtml(detected, prefs, this.orgHistory());
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (msg: Record<string, unknown>) => void this.handleMessage(msg),
       null,
       this.disposables
     );
+    this.loadCliAliases();
+  }
+
+  // Org aliases connected to successfully, most recent first; offered as suggestions in the org box.
+  private orgHistory(): string[] {
+    return ReleaseCheckerPanel.context?.globalState.get<string[]>('orgHistory') ?? [];
+  }
+
+  // The sf CLI's own aliases (authorised orgs) come after the ones used here, so an org never connected to yet is still offered.
+  private cliAliases: string[] = [];
+
+  private postOrgSuggestions(): void {
+    const seen = new Set<string>();
+    const orgs = [...this.orgHistory(), ...this.cliAliases].filter(a => {
+      const k = a.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    this.post({ type: 'orgHistory', orgs });
+  }
+
+  private rememberOrg(alias: string): void {
+    const list = [alias, ...this.orgHistory().filter(a => a.toLowerCase() !== alias.toLowerCase())].slice(0, 20);
+    void ReleaseCheckerPanel.context?.globalState.update('orgHistory', list).then(() => this.postOrgSuggestions());
+  }
+
+  private loadCliAliases(): void {
+    const [exe, args] = process.platform === 'win32'
+      ? ['cmd', ['/c', 'sf', 'alias', 'list', '--json']] as const
+      : ['sf', ['alias', 'list', '--json']] as const;
+    const child = spawn(exe, args, { shell: false });
+    let out = '';
+    child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    child.on('error', () => { /* sf not available: history only */ });
+    child.on('close', () => {
+      try {
+        const parsed = JSON.parse(out) as { result?: Array<{ alias?: string }> };
+        this.cliAliases = (parsed.result ?? []).map(r => r.alias ?? '').filter(Boolean).sort((a, b) => a.localeCompare(b));
+        this.postOrgSuggestions();
+      } catch { /* ignore */ }
+    });
   }
 
   private post(data: Record<string, unknown>): void {
@@ -547,6 +589,7 @@ export class ReleaseCheckerPanel {
         'SELECT Id, Name, copado__Status__c FROM copado__Release__c ORDER BY Name LIMIT 500',
         orgAlias
       );
+      this.rememberOrg(orgAlias);
 
       // Fetch story counts per release via aggregate query
       const storyCountMap = new Map<string, number>();
@@ -1075,8 +1118,9 @@ export class ReleaseCheckerPanel {
 
   // ── HTML ────────────────────────────────────────────────────────────────────
 
-  private getHtml(initialOrg = '', prefs: SavedPrefs = {}): string {
+  private getHtml(initialOrg = '', prefs: SavedPrefs = {}, orgs: string[] = []): string {
     const safeOrg = initialOrg.replace(/"/g, '&quot;');
+    const orgOptions = orgs.map(o => `<option value="${o.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"></option>`).join('');
     const savedJson = JSON.stringify(prefs).replace(/</g, '\\u003c');
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1283,7 +1327,8 @@ export class ReleaseCheckerPanel {
     <div class="org-row">
       <div class="org-wrap">
         <span class="org-dot" id="orgDot"></span>
-        <input id="orgAlias" class="org-input" type="text" value="${safeOrg}" placeholder="Org alias, e.g. RBKINT-CPQAI" autocomplete="off"/>
+        <input id="orgAlias" class="org-input" type="text" value="${safeOrg}" placeholder="Org alias, e.g. RBKINT-CPQAI" autocomplete="off" list="orgList"/>
+        <datalist id="orgList">${orgOptions}</datalist>
       </div>
       <button class="btn" onclick="connectOrg()">Connect</button>
     </div>
@@ -1449,7 +1494,15 @@ export class ReleaseCheckerPanel {
     components.forEach(c => c.excludeStories.forEach(s => {
       Object.keys(s.promoEnvs || {}).forEach((env, i) => rank.set(env, Math.min(rank.has(env) ? rank.get(env) : 99, i)));
     }));
-    const envs = [...rank.keys()].sort((a, b) => rank.get(a) - rank.get(b) || a.localeCompare(b));
+    // When every analysed story has the same next environment, "auto" IS that environment: name it in the auto option
+    // and leave it out of the list, so the same choice is not offered twice.
+    const nextEnvs = [...new Set(components.flatMap(c => c.excludeStories.map(s => s.nextEnv).filter(Boolean)))];
+    const autoEnv = nextEnvs.length === 1 ? nextEnvs[0] : '';
+    if (autoEnv && _promoEnv === autoEnv) _promoEnv = '';
+    const envs = [...rank.keys()].filter(e => e !== autoEnv).sort((a, b) => rank.get(a) - rank.get(b) || a.localeCompare(b));
+    const autoLabel = autoEnv ? 'Next environment – ' + autoEnv + ' (auto)'
+      : nextEnvs.length > 1 ? 'Next environment (auto: each story\\'s own – ' + nextEnvs.join(', ') + ')'
+      : 'Next environment (auto)';
     let fellBack = '';
     if (_promoEnv && !envs.includes(_promoEnv)) {
       // Before any analysis there is nothing to compare against, so keep the saved choice.
@@ -1460,7 +1513,7 @@ export class ReleaseCheckerPanel {
       ? 'No analysed story was promoted to ' + fellBack + ', showing each story\\'s next environment'
       : '';
     document.getElementById('promoEnvSel').innerHTML =
-      '<option value="">Next environment (auto)</option>' +
+      '<option value="">' + esc(autoLabel) + '</option>' +
       envs.map(e => '<option value="' + esc(e) + '">' + esc(e) + '</option>').join('');
     document.getElementById('promoEnvSel').value = _promoEnv;
   }
@@ -1468,7 +1521,10 @@ export class ReleaseCheckerPanel {
   function connectOrg() {
     const alias = document.getElementById('orgAlias').value.trim();
     if (!alias) { showStatus('Please enter an org alias.', 'error'); return; }
-    showStatus('Connecting to org and loading releases…', 'info', true);
+    resetAll();
+    renderEnvOptions([]);
+    _awaitingReleases = true;
+    showStatus('Connecting to ' + alias + ' and loading releases…', 'info', true);
     vscode.postMessage({ command: 'fetchReleases', orgAlias: alias });
   }
 
@@ -1593,6 +1649,8 @@ export class ReleaseCheckerPanel {
   }
 
   let _orgInstanceUrl = '';
+  // Set by Connect until the new org's releases arrive; results of an analysis started before that are dropped.
+  let _awaitingReleases = false;
 
   function resetAll() {
     showResultsArea(false);
@@ -1792,7 +1850,11 @@ export class ReleaseCheckerPanel {
         SAVED = msg.prefs;
         refreshPrefsState();
         break;
+      case 'orgHistory':
+        document.getElementById('orgList').innerHTML = (msg.orgs || []).map(o => '<option value="' + esc(o) + '"></option>').join('');
+        break;
       case 'releases': {
+        _awaitingReleases = false;
         _orgInstanceUrl = msg.orgInstanceUrl || '';
         document.getElementById('modeCard').style.display = 'block';
         document.getElementById('orgDot').classList.add('on');
@@ -1804,6 +1866,7 @@ export class ReleaseCheckerPanel {
         break;
       }
       case 'results':
+        if (_awaitingReleases) break;
         _orgInstanceUrl = msg.orgInstanceUrl || _orgInstanceUrl;
         document.getElementById('btnAnalyseReleases').disabled = false;
         document.getElementById('btnAnalyseStories').disabled = false;
@@ -1833,6 +1896,7 @@ export class ReleaseCheckerPanel {
         scrollToStatus();
         break;
       case 'error':
+        _awaitingReleases = false;
         document.getElementById('btnAnalyseReleases').disabled = false;
         document.getElementById('btnAnalyseStories').disabled = false;
         showStatus('Error: ' + msg.message, 'error', false);
