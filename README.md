@@ -1,4 +1,4 @@
-# Release Conflict Checker
+# Release Overlap Inspector
 
 `sf-release-conflict-checker` — a VS Code extension that identifies common Salesforce metadata between releases or user stories and shows the Git diffs.
 

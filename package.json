@@ -1,9 +1,10 @@
 {
   "name": "sf-release-conflict-checker",
-  "displayName": "SF Release Conflict Checker",
+  "displayName": "Release Overlap Inspector",
   "description": "Identify common Salesforce metadata between releases or user stories and view Git diffs",
   "version": "1.0.0",
   "publisher": "naveengit9",
+  "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -16,7 +17,7 @@
     "commands": [
       {
         "command": "sf-release-conflict-checker.open",
-        "title": "SF: Release Conflict Checker"
+        "title": "SF: Release Overlap Inspector"
       }
     ]
   },

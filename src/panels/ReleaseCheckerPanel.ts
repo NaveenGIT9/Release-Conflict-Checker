@@ -9,7 +9,7 @@ import { GitContentProvider } from '../extension';
 
 let _out: vscode.OutputChannel | undefined;
 function log(msg: string): void {
-  if (!_out) _out = vscode.window.createOutputChannel('SF Release Checker');
+  if (!_out) _out = vscode.window.createOutputChannel('Release Overlap Inspector');
   _out.appendLine(`[${new Date().toISOString()}] ${msg}`);
 }
 
@@ -440,10 +440,11 @@ export class ReleaseCheckerPanel {
     }
     const panel = vscode.window.createWebviewPanel(
       'sfReleaseConflictChecker',
-      'Release Conflict Checker',
+      'Release Overlap Inspector',
       vscode.ViewColumn.One,
       { enableScripts: true, retainContextWhenHidden: true }
     );
+    panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'icon.png');
     ReleaseCheckerPanel.currentPanel = new ReleaseCheckerPanel(panel, extensionUri);
   }
 
@@ -802,7 +803,7 @@ export class ReleaseCheckerPanel {
     });
     if (code !== 0) {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* partial clone */ }
-      throw new Error(`Could not clone ${repoUrl}. Check you have access to it in GitHub (see "SF Release Checker" output for details).`);
+      throw new Error(`Could not clone ${repoUrl}. Check you have access to it in GitHub (see "Release Overlap Inspector" output for details).`);
     }
     return dir;
   }
@@ -1127,7 +1128,7 @@ export class ReleaseCheckerPanel {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Release Conflict Checker</title>
+<title>Release Overlap Inspector</title>
 <style>
   /* Every colour comes from the active VS Code theme, so the panel follows light, dark and high-contrast themes. */
   :root{
@@ -1185,7 +1186,7 @@ export class ReleaseCheckerPanel {
 
   /* ── Side rail ── */
   .rail{background:var(--rail);border-right:1px solid var(--line);padding:16px;position:sticky;top:0;height:100vh;overflow-y:auto}
-  .brand{font-weight:600;font-size:14px}
+  .brand{font-weight:700;font-size:16px;color:var(--promote)}
   .brand small{display:block;font-weight:400;font-size:11px;color:var(--muted);margin-top:2px}
   .lab{display:flex;align-items:baseline;gap:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}
   .lab .cnt{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;color:var(--link)}
@@ -1320,7 +1321,7 @@ export class ReleaseCheckerPanel {
 <div class="app">
 
 <aside class="rail stack">
-  <div class="brand">Release Conflict Checker<small>Shared metadata between releases or stories</small></div>
+  <div class="brand">Release Overlap Inspector<small>Shared metadata between releases or stories</small></div>
 
   <div>
     <div class="lab">Salesforce org</div>
@@ -1563,7 +1564,8 @@ export class ReleaseCheckerPanel {
     const q = (document.getElementById(list + 'Filter').value || '').trim().toLowerCase();
     const mine = new Set(_picked[list]);
     const theirs = new Set(_picked[other]);
-    const rows = _releases.filter(r => mine.has(r.id) || !q || releaseLabel(r).toLowerCase().includes(q));
+    const rows = _releases.filter(r => mine.has(r.id) || !q || releaseLabel(r).toLowerCase().includes(q))
+      .sort((a, b) => Number(mine.has(b.id)) - Number(mine.has(a.id)));
     const otherName = list === 'promote' ? 'future' : 'promote';
     document.getElementById(list + 'List').innerHTML = rows.length
       ? rows.map(r => {
@@ -1602,6 +1604,7 @@ export class ReleaseCheckerPanel {
     if (!box || box.type !== 'checkbox') return;
     _picked[list] = box.checked ? [..._picked[list], box.value] : _picked[list].filter(id => id !== box.value);
     renderReleasePickers();
+    if (box.checked) document.getElementById(list + 'List').scrollTop = 0;
   }
 
   function toggleAll() {
