@@ -448,8 +448,11 @@ export class ReleaseCheckerPanel {
     ReleaseCheckerPanel.currentPanel = new ReleaseCheckerPanel(panel, extensionUri);
   }
 
-  private constructor(panel: vscode.WebviewPanel, _extensionUri: vscode.Uri) {
+  private readonly logoUri: string;
+
+  private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
     this.panel = panel;
+    this.logoUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'icon.png')).toString();
     // Pre-fill: saved alias first, fall back to sf config default org
     const saved    = ReleaseCheckerPanel.context?.globalState.get<string>('lastOrgAlias') ?? '';
     const detected = saved || getDefaultSfOrg();
@@ -1133,7 +1136,6 @@ export class ReleaseCheckerPanel {
   /* Every colour comes from the active VS Code theme, so the panel follows light, dark and high-contrast themes. */
   :root{
     --bg:var(--vscode-editor-background);
-    --rail:var(--vscode-sideBar-background, var(--vscode-editor-background));
     --fg:var(--vscode-foreground);
     --muted:var(--vscode-descriptionForeground);
     --line:var(--vscode-panel-border, var(--vscode-widget-border, rgba(128,128,128,.35)));
@@ -1161,32 +1163,56 @@ export class ReleaseCheckerPanel {
     --placeholder:var(--vscode-input-placeholderForeground);
     --promote:var(--vscode-charts-blue, #3794ff);
     --future:var(--vscode-charts-purple, #b180d7);
+    --r:4px; --r-sm:2px;
+    --glass:var(--card); --glass-line:var(--line); --glass-shadow:none; --glass-blur:none;
+    --seg-on:var(--accent); --seg-on-fg:var(--accent-fg);
   }
   /* Panel-only theme override; "auto" leaves the VS Code theme in charge. */
-  :root[data-theme="dark"]{
-    color-scheme:dark;
-    --bg:#1f1f1f; --rail:#181818; --fg:#cccccc; --muted:#9d9d9d; --line:#2b2b2b; --card:#202020;
-    --hover:#2a2d2e; --sel:#37373d; --accent:#0078d4; --accent-fg:#ffffff; --accent-hover:#026ec1;
-    --sec:#313131; --sec-fg:#cccccc; --sec-hover:#3c3c3c; --input:#313131; --input-fg:#cccccc; --input-line:#3c3c3c;
-    --focus:#0078d4; --link:#4daafc; --badge:#616161; --badge-fg:#f8f8f8; --placeholder:#989898;
-    --ok:#73c991; --warn:#cca700; --err:#f48771; --info:#3794ff; --promote:#3794ff; --future:#b180d7;
+  :root[data-theme="dark"]{color-scheme:dark}
+  :root[data-theme="light"]{color-scheme:light}
+  /* Overrides VS Code's injected scrollbar styles, which follow the editor theme rather than the panel theme. */
+  html ::-webkit-scrollbar{width:10px;height:10px;background:transparent}
+  html ::-webkit-scrollbar-track, html ::-webkit-scrollbar-corner{background:transparent}
+  html ::-webkit-scrollbar-thumb{background:color-mix(in srgb, var(--accent) 26%, transparent);border:3px solid transparent;border-radius:99px;background-clip:padding-box;min-height:28px}
+  html ::-webkit-scrollbar-thumb:hover{background-color:color-mix(in srgb, var(--accent) 45%, transparent)}
+  html ::-webkit-scrollbar-thumb:active{background-color:color-mix(in srgb, var(--accent) 60%, transparent)}
+  html ::-webkit-scrollbar-button{display:none;width:0;height:0}
+  /* Ice-glass palettes; high-contrast themes keep the plain VS Code colours above. */
+  html[data-theme="light"] body, html:not([data-theme]) body.vscode-light{
+    --backdrop:radial-gradient(900px 600px at 0% 100%,#d3eaf8 0,transparent 60%) fixed,radial-gradient(800px 600px at 100% 0%,#dceefa 0,transparent 60%) fixed,linear-gradient(160deg,#f7fbfe,#eaf4fb 55%,#e2f0f9) fixed;
+    --bg:#eef6fc; --fg:#14324a; --muted:#4a7392; --line:rgba(47,134,196,.16); --card:rgba(255,255,255,.7);
+    --hover:rgba(47,134,196,.07); --sel:#ffffff; --accent:#2f86c4; --accent-fg:#ffffff; --accent-hover:#2574ad;
+    --sec:rgba(255,255,255,.85); --sec-fg:#1f5f8f; --sec-hover:#ffffff; --input:rgba(255,255,255,.9); --input-fg:#14324a; --input-line:rgba(47,134,196,.24);
+    --focus:#2f86c4; --link:#1f6fae; --badge:rgba(47,134,196,.12); --badge-fg:#1f5f8f; --placeholder:#7896ad;
+    --ok:#1f9d63; --warn:#c27c0e; --err:#d6455d; --info:#2f86c4; --promote:#2f86c4; --future:#0f8fa3;
+    --pick-promote:#1f9d63; --pick-future:#c27c0e;
+    --r:16px; --r-sm:9px;
+    --glass:rgba(255,255,255,.55); --glass-line:rgba(255,255,255,.95); --glass-shadow:inset 0 1px 0 #fff,0 10px 30px rgba(60,120,170,.10); --glass-blur:blur(20px) saturate(160%);
+    --seg-on:#ffffff; --seg-on-fg:#1f5f8f;
   }
-  :root[data-theme="light"]{
-    color-scheme:light;
-    --bg:#ffffff; --rail:#f8f8f8; --fg:#3b3b3b; --muted:#6e6e6e; --line:#e5e5e5; --card:#ffffff;
-    --hover:#f2f2f2; --sel:#e8e8e8; --accent:#005fb8; --accent-fg:#ffffff; --accent-hover:#0258a8;
-    --sec:#e5e5e5; --sec-fg:#3b3b3b; --sec-hover:#cccccc; --input:#ffffff; --input-fg:#3b3b3b; --input-line:#cecece;
-    --focus:#005fb8; --link:#005fb8; --badge:#cccccc; --badge-fg:#3b3b3b; --placeholder:#767676;
-    --ok:#388a34; --warn:#9a6700; --err:#c72e0f; --info:#1a85ff; --promote:#1a6fd6; --future:#8a4fbf;
+  html[data-theme="dark"] body, html:not([data-theme]) body.vscode-dark{
+    --backdrop:radial-gradient(900px 600px at 0% 100%,rgba(47,134,196,.22) 0,transparent 60%) fixed,radial-gradient(800px 600px at 100% 0%,rgba(90,169,220,.16) 0,transparent 60%) fixed,linear-gradient(160deg,#0c141d,#0f1b27 55%,#0b1620) fixed;
+    --bg:#0e1823; --fg:#dbe8f2; --muted:#8ea7bb; --line:rgba(140,190,230,.14); --card:rgba(255,255,255,.05);
+    --hover:rgba(140,190,230,.08); --sel:rgba(140,190,230,.14); --accent:#3b8fd0; --accent-fg:#ffffff; --accent-hover:#4a9cdc;
+    --sec:rgba(255,255,255,.07); --sec-fg:#cfe2f1; --sec-hover:rgba(255,255,255,.12); --input:rgba(255,255,255,.06); --input-fg:#dbe8f2; --input-line:rgba(140,190,230,.22);
+    --focus:#5aa9dc; --link:#7cc0ec; --badge:rgba(140,190,230,.16); --badge-fg:#cfe2f1; --placeholder:#6f8aa0;
+    --ok:#4cc38a; --warn:#e0a63a; --err:#f07186; --info:#5aa9dc; --promote:#5aa9dc; --future:#3cc2d4;
+    --pick-promote:#4cc38a; --pick-future:#e0a63a;
+    --r:16px; --r-sm:9px;
+    --glass:rgba(255,255,255,.045); --glass-line:rgba(255,255,255,.09); --glass-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 10px 30px rgba(0,0,0,.25); --glass-blur:blur(20px) saturate(140%);
+    --seg-on:rgba(255,255,255,.13); --seg-on-fg:#ffffff;
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:var(--vscode-font-family, 'Segoe UI', system-ui, sans-serif);font-size:var(--vscode-font-size, 13px);line-height:1.5;background:var(--bg);color:var(--fg)}
-  .app{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh}
+  body{font-family:var(--vscode-font-family, 'Segoe UI', system-ui, sans-serif);font-size:var(--vscode-font-size, 13px);line-height:1.5;background:var(--backdrop, var(--bg));color:var(--fg)}
+  .app{display:grid;grid-template-columns:300px minmax(0,1fr);gap:14px;padding:14px;min-height:100vh}
   .stack > * + *{margin-top:16px}
+  .glass{background:var(--glass);border:1px solid var(--glass-line);border-radius:var(--r);box-shadow:var(--glass-shadow);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur)}
 
   /* ── Side rail ── */
-  .rail{background:var(--rail);border-right:1px solid var(--line);padding:16px;position:sticky;top:0;height:100vh;overflow-y:auto}
+  .rail{padding:16px;position:sticky;top:14px;height:calc(100vh - 28px);overflow-y:auto}
   .brand{font-weight:700;font-size:16px;color:var(--promote)}
+  .brand{display:flex;align-items:center;gap:10px}
+  .brand-logo{flex-shrink:0;width:34px;height:34px;object-fit:contain}
   .brand small{display:block;font-weight:400;font-size:11px;color:var(--muted);margin-top:2px}
   .lab{display:flex;align-items:baseline;gap:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}
   .lab .cnt{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;color:var(--link)}
@@ -1194,18 +1220,20 @@ export class ReleaseCheckerPanel {
   .org-wrap{position:relative;flex:1;min-width:0}
   .org-dot{position:absolute;left:9px;top:50%;width:7px;height:7px;margin-top:-3.5px;border-radius:50%;background:var(--muted);opacity:.45}
   .org-dot.on{background:var(--ok);opacity:1}
-  input[type=text],input[type=search]{width:100%;background:var(--input);color:var(--input-fg);border:1px solid var(--input-line);border-radius:2px;padding:5px 8px;font:inherit;outline:none}
+  input[type=text],input[type=search]{width:100%;background:var(--input);color:var(--input-fg);border:1px solid var(--input-line);border-radius:var(--r-sm);padding:5px 8px;font:inherit;outline:none}
   input[type=text]:focus,input[type=search]:focus{border-color:var(--focus);outline:1px solid var(--focus);outline-offset:-1px}
-  select{width:100%;background:var(--input);color:var(--input-fg);border:1px solid var(--input-line);border-radius:2px;padding:4px 6px;font:inherit;outline:none}
+  select{width:100%;background:var(--input);color:var(--input-fg);border:1px solid var(--input-line);border-radius:var(--r-sm);padding:4px 6px;font:inherit;outline:none}
   select:focus{border-color:var(--focus);outline:1px solid var(--focus);outline-offset:-1px}
   input::placeholder{color:var(--placeholder)}
   .org-input{font-family:var(--mono);padding-left:22px !important}
   .mono-input{font-family:var(--mono)}
-  .seg{display:grid;grid-template-columns:1fr 1fr;gap:2px;padding:2px;border:1px solid var(--line);border-radius:3px}
-  .tab{text-align:center;padding:4px;border-radius:2px;cursor:pointer;color:var(--muted);user-select:none}
+  .seg{display:grid;grid-template-columns:1fr 1fr;gap:2px;padding:2px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--hover)}
+  .tab{text-align:center;padding:4px;border-radius:calc(var(--r-sm) - 2px);cursor:pointer;color:var(--muted);user-select:none}
   .tab:hover{color:var(--fg);background:var(--hover)}
-  .tab.active{background:var(--accent);color:var(--accent-fg)}
-  .pick-group{--g:var(--promote);border:1px solid var(--line);border-left:3px solid var(--g);border-radius:3px;padding:10px;background:color-mix(in srgb, var(--g) 5%, transparent)}
+  .tab.active{background:var(--seg-on);color:var(--seg-on-fg);font-weight:600;box-shadow:0 1px 3px rgba(40,90,130,.15)}
+  .pick-group.promote{--promote:var(--pick-promote, var(--vscode-charts-green, #388a34))}
+  .pick-group.future{--future:var(--pick-future, var(--vscode-charts-yellow, #c27c0e))}
+  .pick-group{--g:var(--promote);border:1px solid var(--line);border-left:3px solid var(--g);border-radius:var(--r-sm);padding:10px;background:color-mix(in srgb, var(--g) 5%, var(--glass))}
   .pick-group.future{--g:var(--future)}
   .pick-group .lab{color:var(--g)}
   .pick-group .lab svg{flex-shrink:0;align-self:center}
@@ -1213,7 +1241,7 @@ export class ReleaseCheckerPanel {
   .pick-group .lab .cnt:empty{display:none}
   .pick-hint{font-size:11px;color:var(--muted);margin:-3px 0 6px}
   .pick-filter{margin-bottom:4px}
-  .pick-list{max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:2px;background:var(--bg)}
+  .pick-list{max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--input)}
   .pick{display:flex;gap:8px;align-items:flex-start;padding:4px 8px;cursor:pointer;border-left:2px solid transparent}
   .pick:hover{background:var(--hover)}
   .pick input{margin-top:3px;accent-color:var(--g);flex-shrink:0}
@@ -1226,7 +1254,7 @@ export class ReleaseCheckerPanel {
   .field label{display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}
 
   /* ── Buttons ── */
-  .btn{background:var(--accent);color:var(--accent-fg);border:1px solid var(--vscode-button-border, transparent);border-radius:2px;padding:5px 12px;font:inherit;cursor:pointer;white-space:nowrap}
+  .btn{background:var(--accent);color:var(--accent-fg);border:1px solid var(--vscode-button-border, transparent);border-radius:var(--r-sm);padding:5px 12px;font:inherit;cursor:pointer;white-space:nowrap}
   .btn:hover{background:var(--accent-hover)}
   .btn:focus-visible{outline:1px solid var(--focus);outline-offset:2px}
   .btn:disabled{opacity:.5;cursor:default}
@@ -1238,8 +1266,9 @@ export class ReleaseCheckerPanel {
   .btn-pr:hover{background:var(--sec-hover)}
 
   /* ── Main area ── */
-  .main{padding:20px 24px 40px;min-width:0}
-  .status-bar{display:none;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line);border-left:3px solid var(--info);border-radius:3px;font-size:12px}
+  .main{min-width:0;padding-bottom:26px}
+  .topbar.glass{padding:7px 10px 7px 16px}
+  .status-bar{display:none;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line);border-left:3px solid var(--info);border-radius:var(--r-sm);font-size:12px;backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur)}
   .status-bar.show{display:flex}
   .status-info{border-left-color:var(--info);background:color-mix(in srgb, var(--info) 9%, transparent)}
   .status-success{border-left-color:var(--ok);background:color-mix(in srgb, var(--ok) 9%, transparent)}
@@ -1247,12 +1276,12 @@ export class ReleaseCheckerPanel {
   .status-error{border-left-color:var(--err);background:color-mix(in srgb, var(--err) 10%, transparent)}
   .spinner{width:14px;height:14px;flex-shrink:0;border:2px solid color-mix(in srgb, var(--fg) 20%, transparent);border-top-color:var(--focus);border-radius:50%;animation:spin .7s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .empty{border:1px dashed var(--line);border-radius:4px;padding:48px 24px;text-align:center;color:var(--muted)}
+  .empty{border:1px dashed var(--line);border-radius:var(--r);padding:48px 24px;text-align:center;color:var(--muted)}
   .empty b{display:block;color:var(--fg);font-size:14px;font-weight:600;margin-bottom:4px}
   .empty svg{display:block;margin:0 auto 12px;opacity:.6}
 
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden}
-  .kpi{background:var(--card);padding:10px 14px}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+  .kpi{padding:10px 14px;background:var(--glass);border:1px solid var(--glass-line);border-radius:calc(var(--r) - 2px);box-shadow:var(--glass-shadow);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur)}
   .kpi b{display:block;font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
   .kpi span{font-size:11px;color:var(--muted)}
   .kpi.warn b{color:var(--warn)}
@@ -1262,24 +1291,42 @@ export class ReleaseCheckerPanel {
   .results-badge{background:var(--badge);color:var(--badge-fg);border-radius:10px;padding:0 7px;min-width:20px;text-align:center;font-size:11px;font-weight:600}
   .results-header .sp{flex:1}
 
-  .component-list{display:flex;flex-direction:column;gap:6px}
-  .component-item{border:1px solid var(--line);border-radius:4px;background:var(--card)}
-  /* Fixed trailing columns keep type badges, counts and risk dots aligned across rows. */
-  .component-header{display:grid;grid-template-columns:12px minmax(0,1fr) 190px 70px 8px;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;user-select:none}
+  .results.glass{padding:12px 14px}
+  .results > * + *{margin-top:12px}
+  .risk-tally{display:flex;gap:6px;flex-wrap:wrap}
+  .risk-pill{--c:var(--muted);display:inline-flex;align-items:center;gap:6px;padding:1px 9px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap;color:var(--c);background:color-mix(in srgb, var(--c) 12%, transparent);border:1px solid color-mix(in srgb, var(--c) 40%, transparent)}
+  .risk-pill::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--c)}
+  .risk-pill.high{--c:var(--err)} .risk-pill.med{--c:var(--warn)} .risk-pill.low{--c:var(--ok)}
+
+  /* Component list on the left, the selected component's story timeline on the right. */
+  .component-list{display:grid;grid-template-columns:minmax(200px,260px) minmax(0,1fr);gap:14px;align-items:start}
+  .comp-nav{display:flex;flex-direction:column;gap:1px;padding:6px;border-radius:calc(var(--r) - 4px);background:var(--glass);border:1px solid var(--glass-line);position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto}
+  .component-header{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:var(--r-sm);cursor:pointer;user-select:none;border:0;background:none;color:inherit;font:inherit;text-align:left;width:100%}
+  .comp-nav{gap:10px;padding:0;background:none;border:0}
+  .nav-sec{display:flex;flex-direction:column;gap:1px;padding:4px 5px 5px;border-radius:calc(var(--r) - 4px);background:var(--glass);border:1px solid var(--glass-line);box-shadow:var(--glass-shadow)}
+  .nav-group{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 -5px 4px;padding:6px 14px 7px;font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--accent);border-bottom:1px solid var(--line)}
+  .nav-count{min-width:18px;padding:0 6px;border-radius:99px;text-align:center;font-size:10px;letter-spacing:0;color:var(--accent);background:color-mix(in srgb, var(--accent) 13%, transparent)}
   .component-header:hover{background:var(--hover)}
-  .component-chevron{display:inline-flex;color:var(--muted);transition:transform .15s}
-  .component-chevron.open{transform:rotate(90deg)}
-  .component-name{font-family:var(--mono);flex:1;min-width:0;overflow-wrap:anywhere}
-  .component-type{justify-self:start;max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:11px;background:var(--badge);color:var(--badge-fg);border-radius:10px;padding:0 8px;white-space:nowrap}
-  .component-count{font-size:12px;color:var(--muted);white-space:nowrap;text-align:right}
+  .component-header.on{background:var(--sel);box-shadow:0 3px 12px rgba(47,134,196,.14)}
+  .component-header:focus-visible{outline:1px solid var(--focus)}
+  .component-name{font-family:var(--mono);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .component-count{font-size:11px;color:var(--muted);white-space:nowrap}
+  .component-type{font-size:11px;background:var(--badge);color:var(--badge-fg);border-radius:10px;padding:0 8px;white-space:nowrap}
   .risk{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-  .risk-high{background:var(--err)}
-  .risk-med{background:var(--warn)}
-  .risk-low{background:var(--ok)}
-  .component-stories{display:none;border-top:1px solid var(--line);padding:0 12px 0 34px}
+  .risk-high{background:var(--err);box-shadow:0 0 8px color-mix(in srgb, var(--err) 60%, transparent)}
+  .risk-med{background:var(--warn);box-shadow:0 0 8px color-mix(in srgb, var(--warn) 60%, transparent)}
+  .risk-low{background:var(--ok);box-shadow:0 0 8px color-mix(in srgb, var(--ok) 60%, transparent)}
+  .comp-detail{min-width:0}
+  .component-stories{display:none}
   .component-stories.open{display:block}
-  .story-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px dashed var(--line)}
-  .story-row:last-child{border-bottom:0}
+  .component-stories + .component-stories.open{margin-top:18px}
+  .detail-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .detail-name{font-family:var(--mono);font-weight:600;font-size:13.5px;overflow-wrap:anywhere}
+  .detail-sub{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:2px}
+  .timeline{position:relative;margin-top:10px;padding-left:24px}
+  .timeline::before{content:'';position:absolute;left:6px;top:8px;bottom:8px;width:2px;border-radius:2px;background:linear-gradient(color-mix(in srgb, var(--promote) 55%, transparent),color-mix(in srgb, var(--promote) 18%, transparent))}
+  .story-row{position:relative;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:9px 12px;margin-bottom:8px;border-radius:calc(var(--r) - 4px);background:var(--card);border:1px solid var(--glass-line);box-shadow:var(--glass-shadow)}
+  .story-row::before{content:'';position:absolute;left:-23px;top:14px;width:9px;height:9px;border-radius:50%;background:var(--bg);border:3px solid var(--promote)}
   .story-info{display:flex;flex-direction:column;gap:3px;min-width:0}
   .story-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .story-name{font-family:var(--mono);font-weight:600}
@@ -1290,11 +1337,11 @@ export class ReleaseCheckerPanel {
   .topbar .crumb{flex:1;min-width:0;font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center}
   .crumb .c-p{color:var(--promote);font-weight:600}
   .crumb .c-f{color:var(--future);font-weight:600}
-  .theme-toggle{display:inline-flex;border:1px solid var(--line);border-radius:3px;padding:2px;gap:2px;flex-shrink:0}
-  .theme-toggle button{display:inline-flex;align-items:center;gap:5px;background:none;border:0;color:var(--muted);padding:3px 8px;border-radius:2px;font:inherit;font-size:12px;cursor:pointer}
+  .theme-toggle{display:inline-flex;border:1px solid var(--line);border-radius:var(--r-sm);padding:2px;background:var(--hover);gap:2px;flex-shrink:0}
+  .theme-toggle button{display:inline-flex;align-items:center;gap:5px;background:none;border:0;color:var(--muted);padding:3px 8px;border-radius:calc(var(--r-sm) - 2px);font:inherit;font-size:12px;cursor:pointer}
   .theme-toggle button:hover{color:var(--fg);background:var(--hover)}
   .theme-toggle button:focus-visible{outline:1px solid var(--focus)}
-  .theme-toggle button[aria-pressed="true"]{background:var(--accent);color:var(--accent-fg)}
+  .theme-toggle button[aria-pressed="true"]{background:var(--seg-on);color:var(--seg-on-fg);font-weight:600;box-shadow:0 1px 3px rgba(40,90,130,.15)}
   .prefs-state{font-size:11px;color:var(--muted);flex-shrink:0;white-space:nowrap}
   #btnSavePrefs{flex-shrink:0}
   #btnSavePrefs:disabled{opacity:.5;cursor:default}
@@ -1306,22 +1353,26 @@ export class ReleaseCheckerPanel {
   .pr-pill.pr-closed{background:color-mix(in srgb, var(--err) 16%, transparent)}
   a.pr-pill:hover{text-decoration:underline}
   .story-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0;max-width:45%}
-  .no-common{padding:32px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:4px}
+  .no-common{padding:32px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:var(--r)}
   .no-common b{display:block;color:var(--ok);font-size:14px;margin-bottom:4px}
   .legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:8px}
+  .pr-pill,.story-release-tag{border-radius:6px}
 
   @media (max-width:720px){
     .app{grid-template-columns:1fr}
-    .rail{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}
-    .main{padding:16px}
+    .rail{position:static;height:auto}
+  }
+  @media (max-width:640px){
+    .component-list{grid-template-columns:1fr}
+    .comp-nav{position:static;max-height:240px}
   }
 </style>
 </head>
 <body>
 <div class="app">
 
-<aside class="rail stack">
-  <div class="brand">Release Overlap Inspector<small>Shared metadata between releases or stories</small></div>
+<aside class="rail glass stack">
+  <div class="brand"><img class="brand-logo" src="${this.logoUri}" alt="" width="34" height="34"/><div>Release Overlap Inspector<small>Shared metadata between releases or stories</small></div></div>
 
   <div>
     <div class="lab">Salesforce org</div>
@@ -1389,7 +1440,7 @@ export class ReleaseCheckerPanel {
 </aside>
 
 <main class="main stack">
-  <div class="topbar">
+  <div class="topbar glass">
     <div class="crumb" id="crumb"></div>
     <div class="theme-toggle" role="group" aria-label="Panel theme">
       <button type="button" data-theme-btn="auto" title="Follow the VS Code theme"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor"/></svg>Auto</button>
@@ -1412,15 +1463,18 @@ export class ReleaseCheckerPanel {
 
   <div id="resultsSection" class="stack" style="display:none">
     <div class="kpis" id="statRow"></div>
-    <div class="results-header">
-      <span class="results-title">Shared components</span>
-      <span class="results-badge" id="commonBadge">0</span>
-      <span class="sp"></span>
-      <button class="btn btn-sec btn-sm" id="btnToggleAll" onclick="toggleAll()">Expand all</button>
-      <button class="btn btn-sec btn-sm" onclick="resetAll()">Reset</button>
+    <div class="results glass">
+      <div class="results-header">
+        <span class="results-title">Shared components</span>
+        <span class="results-badge" id="commonBadge">0</span>
+        <span class="sp"></span>
+        <span class="risk-tally" id="riskTally"></span>
+        <button class="btn btn-sec btn-sm" id="btnToggleAll" onclick="toggleAll()">Expand all</button>
+        <button class="btn btn-sec btn-sm" onclick="resetAll()">Reset</button>
+      </div>
+      <div id="componentList" class="component-list"></div>
+      <div class="legend" id="legend"></div>
     </div>
-    <div id="componentList" class="component-list"></div>
-    <div class="legend" id="legend"></div>
   </div>
 </main>
 
@@ -1473,8 +1527,8 @@ export class ReleaseCheckerPanel {
       ? 'PRs from Completed promotions into the environment right after the story\\'s origin (latest SFDX Promote and SFDX Deploy successful)'
       : 'PRs raised from each story\\'s feature branch';
     document.getElementById('legend').innerHTML = _prSource === 'promo'
-      ? '<span>Promotion PR diff: only the commit merging the story into the promotion branch</span><span>#N: one promotion PR</span><span>All PRs Diff: all qualified promotions combined</span>'
-      : '<span>PR diff: only the story\\'s own PR commits, base-branch commits excluded</span><span>#N: one PR</span><span>Branch diff (no PR): feature branch vs base branch</span>';
+      ? '<span><b>PR Diff</b> shows only what the story\\'s merge brought into the promotion branch</span><span><b>#N</b> shows a single promotion PR</span><span><b>All PRs Diff</b> combines every qualifying promotion PR</span>'
+      : '<span><b>PR Diff</b> shows only the story\\'s own commits, without base-branch changes</span><span><b>#N</b> shows a single PR</span><span><b>Branch Diff</b> compares the feature branch with its base when there is no PR</span>';
     document.getElementById('envPick').style.display = _prSource === 'promo' ? 'block' : 'none';
     vscode.setState(Object.assign({}, vscode.getState() || {}, { prSource: _prSource }));
     refreshPrefsState();
@@ -1610,8 +1664,8 @@ export class ReleaseCheckerPanel {
   function toggleAll() {
     const btn = document.getElementById('btnToggleAll');
     const open = btn.textContent === 'Expand all';
-    document.querySelectorAll('.component-stories').forEach(el => el.classList.toggle('open', open));
-    document.querySelectorAll('.component-chevron').forEach(el => el.classList.toggle('open', open));
+    if (open) document.querySelectorAll('.component-stories').forEach(el => el.classList.add('open'));
+    else toggleComponent(_selected);
     btn.textContent = open ? 'Collapse all' : 'Expand all';
   }
 
@@ -1643,12 +1697,14 @@ export class ReleaseCheckerPanel {
     vscode.postMessage({ command: 'analyseStories', story1, story2 });
   }
 
+  let _selected = 0;
+
   function toggleComponent(id) {
-    const stories = document.getElementById('stories-' + id);
-    const chevron = document.getElementById('chevron-' + id);
-    const isOpen = stories.classList.contains('open');
-    stories.classList.toggle('open', !isOpen);
-    chevron.classList.toggle('open', !isOpen);
+    _selected = id;
+    document.querySelectorAll('.component-stories').forEach(el => el.classList.toggle('open', el.id === 'stories-' + id));
+    document.querySelectorAll('.component-header').forEach(el => el.classList.toggle('on', el.dataset.idx === String(id)));
+    const btn = document.getElementById('btnToggleAll');
+    if (btn) btn.textContent = 'Expand all';
   }
 
   let _orgInstanceUrl = '';
@@ -1789,13 +1845,24 @@ export class ReleaseCheckerPanel {
       kpi(allStories.size, mode === 'story' ? 'Stories involved' : 'Future-release stories') +
       kpi(noPr, _prSource === 'promo' ? 'Stories without a promotion PR' : 'Stories without a PR', noPr ? 'warn' : '');
 
+    const tally = document.getElementById('riskTally');
     if (components.length === 0) {
+      tally.innerHTML = '';
+      list.style.display = 'block';
       list.innerHTML = '<div class="no-common"><b>No shared components</b>Both sides touch completely separate metadata.</div>';
       return;
     }
+    list.style.display = '';
+
+    components = components.slice().sort((a, b) =>
+      String(a.type).localeCompare(String(b.type)) || String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base' }));
+    const typeCount = {};
+    components.forEach(c => { typeCount[c.type] = (typeCount[c.type] || 0) + 1; });
 
     _rows = [];
-    list.innerHTML = components.map((comp, idx) => {
+    const navItems = [];
+    const counts = { high: 0, med: 0, low: 0 };
+    const details = components.map((comp, idx) => {
       const storyRows = comp.excludeStories.map(s => {
         const hasBranch = !!(s.featureBranch && s.featureBranch.length > 0);
         const prs = prsOf(s);
@@ -1816,7 +1883,7 @@ export class ReleaseCheckerPanel {
         } else {
           actions = '<span class="no-branch">No branch</span>';
         }
-        return '<div class="story-row" id="story-row-' + esc(s.name) + '-' + idx + '">' +
+        return '<div class="story-row">' +
           '<div class="story-info">' +
             '<div class="story-top"><span class="story-name">' + storyNameHtml(s) + '</span>' +
               (s.releaseName ? '<span class="story-release-tag">' + esc(s.releaseName) + '</span>' : '') + '</div>' +
@@ -1830,20 +1897,46 @@ export class ReleaseCheckerPanel {
       const n = comp.excludeStories.length;
       const anyNoPr = comp.excludeStories.some(s => !prsOf(s).length);
       const risk = n >= 2 && anyNoPr ? 'high' : (n >= 2 || anyNoPr ? 'med' : 'low');
-      const riskTip = { high: 'Several stories, at least one without a PR', med: 'Several stories, or a story without a PR', low: 'One story with a PR' }[risk];
-      return '<div class="component-item">' +
-        '<div class="component-header" onclick="toggleComponent(' + idx + ')">' +
-          '<span class="component-chevron" id="chevron-' + idx + '"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></span>' +
+      const withPr = comp.excludeStories.filter(s => prsOf(s).length).length;
+      const tip = riskTip(risk, n, n - withPr);
+      counts[risk]++;
+      if (idx === 0 || components[idx - 1].type !== comp.type) {
+        navItems.push((idx ? '</div>' : '') + '<div class="nav-sec"><div class="nav-group"><span>' + esc(comp.type) + '</span><span class="nav-count">' + typeCount[comp.type] + '</span></div>');
+      }
+      navItems.push(
+        '<button type="button" class="component-header" data-idx="' + idx + '" onclick="toggleComponent(' + idx + ')" title="' + esc(comp.name) + ' · ' + tip + '">' +
+          '<span class="risk risk-' + risk + '"></span>' +
           '<span class="component-name">' + esc(comp.name) + '</span>' +
-          '<span class="component-type">' + esc(comp.type) + '</span>' +
-          '<span class="component-count">' + n + ' stor' + (n === 1 ? 'y' : 'ies') + '</span>' +
-          '<span class="risk risk-' + risk + '" title="' + riskTip + '"></span>' +
-        '</div>' +
-        '<div class="component-stories" id="stories-' + idx + '">' +
-          storyRows +
-        '</div>' +
-      '</div>';
+          '<span class="component-count">' + n + '</span>' +
+        '</button>');
+      return '<div class="component-stories" id="stories-' + idx + '">' +
+          '<div class="detail-head"><div><div class="detail-name">' + esc(comp.name) + '</div>' +
+            '<div class="detail-sub"><span class="component-type">' + esc(comp.type) + '</span>' +
+              n + ' stor' + (n === 1 ? 'y' : 'ies') + ' · ' + (withPr === 0 ? 'none' : withPr + ' of ' + n) + ' with a ' + (_prSource === 'promo' ? 'promotion ' : '') + 'PR</div></div>' +
+            '<span class="risk-pill ' + risk + '" title="' + tip + '">' + RISK_LABEL[risk] + '</span></div>' +
+          '<div class="timeline">' + storyRows + '</div>' +
+        '</div>';
     }).join('');
+
+    tally.innerHTML = ['high', 'med', 'low'].filter(r => counts[r])
+      .map(r => '<span class="risk-pill ' + r + '" title="' + riskTip(r) + '">' + counts[r] + ' ' + RISK_LABEL[r] + '</span>').join('');
+    list.innerHTML = '<nav class="comp-nav" aria-label="Shared components">' + navItems.join('') + '</div></nav><div class="comp-detail">' + details + '</div>';
+    toggleComponent(0);
+  }
+
+  const RISK_LABEL = { high: 'Needs review', med: 'Check', low: 'Clear' };
+  function riskTip(r, n, missing) {
+    const pr = _prSource === 'promo' ? 'promotion PR' : 'PR';
+    if (n === undefined) {
+      return { high: '2+ stories · a ' + pr + ' missing',
+               med: '2+ stories · all have a ' + pr + ', or 1 story · no ' + pr,
+               low: '1 story · has a ' + pr }[r];
+    }
+    const stories = n === 1 ? '1 story' : n + ' stories';
+    const prs = missing === 0 ? (n === 1 ? 'has a ' : 'all have a ') + pr
+      : missing === n ? (n === 1 ? 'no ' + pr : 'none has a ' + pr)
+      : missing + ' of ' + n + ' without a ' + pr;
+    return stories + ' · ' + prs;
   }
 
   window.addEventListener('message', event => {
