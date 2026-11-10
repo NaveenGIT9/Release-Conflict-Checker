@@ -1693,9 +1693,12 @@ export class ReleaseCheckerPanel {
   }
 
   let _selected = 0;
+  let _selectedKey = '';
 
   function toggleComponent(id) {
     _selected = id;
+    const hdr = document.querySelector('.component-header[data-idx="' + id + '"]');
+    if (hdr) _selectedKey = hdr.dataset.key;
     document.querySelectorAll('.component-stories').forEach(el => el.classList.toggle('open', el.id === 'stories-' + id));
     document.querySelectorAll('.component-header').forEach(el => el.classList.toggle('on', el.dataset.idx === String(id)));
     const btn = document.getElementById('btnToggleAll');
@@ -1899,7 +1902,7 @@ export class ReleaseCheckerPanel {
         navItems.push((idx ? '</div>' : '') + '<div class="nav-sec"><div class="nav-group"><span>' + esc(comp.type) + '</span><span class="nav-count">' + typeCount[comp.type] + '</span></div>');
       }
       navItems.push(
-        '<button type="button" class="component-header" data-idx="' + idx + '" onclick="toggleComponent(' + idx + ')" title="' + esc(comp.name) + ' · ' + tip + '">' +
+        '<button type="button" class="component-header" data-idx="' + idx + '" data-key="' + esc(comp.type + '/' + comp.name) + '" onclick="toggleComponent(' + idx + ')" title="' + esc(comp.name) + ' · ' + tip + '">' +
           '<span class="risk risk-' + risk + '"></span>' +
           '<span class="component-name">' + esc(comp.name) + '</span>' +
           '<span class="component-count">' + n + '</span>' +
@@ -1916,7 +1919,8 @@ export class ReleaseCheckerPanel {
     tally.innerHTML = ['high', 'med', 'low'].filter(r => counts[r])
       .map(r => '<span class="risk-pill ' + r + '" title="' + riskTip(r) + '">' + counts[r] + ' ' + RISK_LABEL[r] + '</span>').join('');
     list.innerHTML = '<nav class="comp-nav" aria-label="Shared components">' + navItems.join('') + '</div></nav><div class="comp-detail">' + details + '</div>';
-    toggleComponent(0);
+    const keep = components.findIndex(c => c.type + '/' + c.name === _selectedKey);
+    toggleComponent(keep >= 0 ? keep : 0);
   }
 
   const RISK_LABEL = { high: 'Needs review', med: 'Check', low: 'Clear' };
