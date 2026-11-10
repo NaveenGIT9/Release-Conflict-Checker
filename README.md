@@ -4,16 +4,16 @@
 
 ## Install
 
-The packaged extension is committed in this repo: **`sf-release-conflict-checker-1.0.0.vsix`**.
+The packaged extension is committed in this repo: **`sf-release-conflict-checker-1.1.0.vsix`**.
 
 **From the VS Code UI**
-1. Download `sf-release-conflict-checker-1.0.0.vsix` from this repo.
+1. Download `sf-release-conflict-checker-1.1.0.vsix` from this repo.
 2. Open Extensions (`Ctrl+Shift+X`) → `…` menu → **Install from VSIX…** → pick the file.
 3. Run **Developer: Reload Window**.
 
 **From a terminal**
 ```
-code --install-extension sf-release-conflict-checker-1.0.0.vsix --force
+code --install-extension sf-release-conflict-checker-1.1.0.vsix --force
 ```
 
 To update, install the new file over the old one (`--force`).
@@ -26,4 +26,4 @@ npm run compile
 npx vsce package
 ```
 
-Requires Node 18+. Produces `sf-release-conflict-checker-1.0.0.vsix`.
+Requires Node 18+. Produces `sf-release-conflict-checker-1.1.0.vsix`.
