@@ -1170,13 +1170,8 @@ export class ReleaseCheckerPanel {
   /* Panel-only theme override; "auto" leaves the VS Code theme in charge. */
   :root[data-theme="dark"]{color-scheme:dark}
   :root[data-theme="light"]{color-scheme:light}
-  /* Overrides VS Code's injected scrollbar styles, which follow the editor theme rather than the panel theme. */
-  html ::-webkit-scrollbar{width:10px;height:10px;background:transparent}
-  html ::-webkit-scrollbar-track, html ::-webkit-scrollbar-corner{background:transparent}
-  html ::-webkit-scrollbar-thumb{background:color-mix(in srgb, var(--accent) 26%, transparent);border:3px solid transparent;border-radius:99px;background-clip:padding-box;min-height:28px}
-  html ::-webkit-scrollbar-thumb:hover{background-color:color-mix(in srgb, var(--accent) 45%, transparent)}
-  html ::-webkit-scrollbar-thumb:active{background-color:color-mix(in srgb, var(--accent) 60%, transparent)}
-  html ::-webkit-scrollbar-button{display:none;width:0;height:0}
+  /* VS Code's webview host sets scrollbar-color with the editor background as the track, which also disables ::-webkit-scrollbar styling. */
+  html, html *{scrollbar-width:thin;scrollbar-color:color-mix(in srgb, var(--accent) 32%, transparent) transparent}
   /* Ice-glass palettes; high-contrast themes keep the plain VS Code colours above. */
   html[data-theme="light"] body, html:not([data-theme]) body.vscode-light{
     --backdrop:radial-gradient(900px 600px at 0% 100%,#d3eaf8 0,transparent 60%) fixed,radial-gradient(800px 600px at 100% 0%,#dceefa 0,transparent 60%) fixed,linear-gradient(160deg,#f7fbfe,#eaf4fb 55%,#e2f0f9) fixed;
