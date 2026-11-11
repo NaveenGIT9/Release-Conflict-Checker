@@ -3,9 +3,13 @@ import { ReleaseCheckerPanel } from './panels/ReleaseCheckerPanel';
 
 export class GitContentProvider implements vscode.TextDocumentContentProvider {
   private readonly cache = new Map<string, string>();
+  private readonly changed = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this.changed.event;
 
   set(key: string, content: string): void {
+    const stale = this.cache.has(key) && this.cache.get(key) !== content;
     this.cache.set(key, content);
+    if (stale) this.changed.fire(vscode.Uri.parse(key));
   }
 
   provideTextDocumentContent(uri: vscode.Uri): string {

@@ -548,7 +548,8 @@ export class ReleaseCheckerPanel {
           typeof msg.prNumber === 'number' ? msg.prNumber : null,
           msg.componentName as string,
           msg.componentType as string,
-          msg.source === 'promo' ? 'promo' : 'feature'
+          msg.source === 'promo' ? 'promo' : 'feature',
+          typeof msg.env === 'string' ? msg.env : ''
         );
         break;
       case 'openUrl':
@@ -820,7 +821,8 @@ export class ReleaseCheckerPanel {
     onlyPr: number | null,
     componentName: string,
     componentType: string,
-    source: 'feature' | 'promo' = 'feature'
+    source: 'feature' | 'promo' = 'feature',
+    env = ''
   ): Promise<void> {
     const storyRepo = repoUrl || repoUrlFrom(allPrs.find(p => p.url)?.url ?? '');
     const requested = onlyPr === null ? allPrs : allPrs.filter(p => p.number === onlyPr);
@@ -893,13 +895,14 @@ export class ReleaseCheckerPanel {
     }
     if (!d.exact) warnings.push('the commits did not replay cleanly, so the right side is the file at the newest story commit');
 
-    const key = `${source}/${encodeURIComponent(storyName)}/${onlyPr ?? 'all'}/${encodeURIComponent(componentName)}`;
+    const prIds = prs.map(p => p.number).sort((a, b) => a - b).join('-');
+    const key = `${source}/${encodeURIComponent(env || '-')}/${encodeURIComponent(storyName)}/${prIds}/${encodeURIComponent(componentName)}`;
     const leftUri  = vscode.Uri.parse(`sfconflict:pr-before/${key}`);
     const rightUri = vscode.Uri.parse(`sfconflict:pr-after/${key}`);
     ReleaseCheckerPanel.gitProvider.set(leftUri.toString(), d.left);
     ReleaseCheckerPanel.gitProvider.set(rightUri.toString(), d.right);
 
-    const title = `${storyName} → ${componentName}  (${source === 'promo' ? 'Promotion ' : ''}PR ${prLabel} · ${d.touching.length} ${unit}${d.touching.length === 1 ? '' : 's'})`;
+    const title = `${storyName} → ${componentName}  (${source === 'promo' ? (env ? env + ' · ' : '') + 'Promotion ' : ''}PR ${prLabel} · ${d.touching.length} ${unit}${d.touching.length === 1 ? '' : 's'})`;
     await this.showDiff(leftUri, rightUri, title);
     log(`PR diff ${storyName} ${componentName}: commits touching file = ${d.touching.map(c => c.slice(0, 10)).join(', ')}`);
     this.post(warnings.length
@@ -1348,6 +1351,12 @@ export class ReleaseCheckerPanel {
   .pr-pill.pr-closed{background:color-mix(in srgb, var(--err) 16%, transparent)}
   a.pr-pill:hover{text-decoration:underline}
   .story-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0;max-width:45%}
+  .comp-search{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+  .comp-search input{flex:0 1 420px;width:100%;min-width:0;padding:7px 12px 7px 32px;border-radius:var(--r-sm);border:1px solid var(--glass-line);background:var(--glass) no-repeat 11px 50%/14px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237a97ad' stroke-width='1.6'%3E%3Ccircle cx='7' cy='7' r='5'/%3E%3Cpath d='M11 11l3.5 3.5' stroke-linecap='round'/%3E%3C/svg%3E");color:var(--fg);font:inherit;font-size:12.5px;outline:none}
+  .comp-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent)}
+  .comp-search-count{font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .comp-empty{padding:14px 10px;font-size:12px;color:var(--muted);text-align:center}
+  .component-header mark{background:color-mix(in srgb, var(--accent) 22%, transparent);color:inherit;border-radius:3px;padding:0 1px}
   .no-common{padding:32px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:var(--r)}
   .no-common b{display:block;color:var(--ok);font-size:14px;margin-bottom:4px}
   .legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:8px}
@@ -1466,6 +1475,10 @@ export class ReleaseCheckerPanel {
         <span class="risk-tally" id="riskTally"></span>
         <button class="btn btn-sec btn-sm" id="btnToggleAll" onclick="toggleAll()">Expand all</button>
         <button class="btn btn-sec btn-sm" onclick="resetAll()">Reset</button>
+      </div>
+      <div class="comp-search" id="compSearchWrap" style="display:none">
+        <input type="search" id="compSearch" placeholder="Search components by name" autocomplete="off" spellcheck="false" oninput="filterComponents()"/>
+        <span class="comp-search-count" id="compSearchCount"></span>
       </div>
       <div id="componentList" class="component-list"></div>
       <div class="legend" id="legend"></div>
@@ -1705,6 +1718,42 @@ export class ReleaseCheckerPanel {
     if (btn) btn.textContent = 'Expand all';
   }
 
+  function filterComponents() {
+    const input = document.getElementById('compSearch');
+    const nav = document.querySelector('.comp-nav');
+    if (!input || !nav) return;
+    const q = input.value.trim().toLowerCase();
+    let shown = 0, total = 0, firstShown = null, selectedShown = false;
+    nav.querySelectorAll('.nav-sec').forEach(sec => {
+      let secShown = 0;
+      sec.querySelectorAll('.component-header').forEach(h => {
+        total++;
+        const nameEl = h.querySelector('.component-name');
+        const name = nameEl.dataset.name || nameEl.textContent;
+        nameEl.dataset.name = name;
+        const at = q ? name.toLowerCase().indexOf(q) : 0;
+        const hit = !q || at >= 0;
+        h.style.display = hit ? '' : 'none';
+        nameEl.innerHTML = q && hit ? esc(name.slice(0, at)) + '<mark>' + esc(name.slice(at, at + q.length)) + '</mark>' + esc(name.slice(at + q.length)) : esc(name);
+        if (hit) {
+          secShown++; shown++;
+          if (firstShown === null) firstShown = h.dataset.idx;
+          if (h.dataset.idx === String(_selected)) selectedShown = true;
+        }
+      });
+      sec.style.display = secShown ? '' : 'none';
+      const cnt = sec.querySelector('.nav-count');
+      if (cnt) cnt.textContent = q ? secShown + '/' + sec.querySelectorAll('.component-header').length : sec.querySelectorAll('.component-header').length;
+    });
+    let empty = nav.querySelector('.comp-empty');
+    if (!shown) {
+      if (!empty) { empty = document.createElement('div'); empty.className = 'comp-empty'; nav.appendChild(empty); }
+      empty.textContent = 'No component matches "' + input.value.trim() + '"';
+    } else if (empty) empty.remove();
+    document.getElementById('compSearchCount').textContent = q ? shown + ' of ' + total : '';
+    if (q && shown && !selectedShown) toggleComponent(firstShown);
+  }
+
   let _orgInstanceUrl = '';
   // Set by Connect until the new org's releases arrive; results of an analysis started before that are dropped.
   let _awaitingReleases = false;
@@ -1712,6 +1761,8 @@ export class ReleaseCheckerPanel {
   function resetAll() {
     showResultsArea(false);
     document.getElementById('componentList').innerHTML = '';
+    document.getElementById('compSearch').value = '';
+    document.getElementById('compSearchCount').textContent = '';
     _last = null;
     document.getElementById('orgDot').classList.remove('on');
     document.getElementById('promoteFilter').value = '';
@@ -1757,6 +1808,7 @@ export class ReleaseCheckerPanel {
     vscode.postMessage({
       command: 'viewPrDiff', storyName: r.s.name, repoUrl: r.s.repoUrl, baseBranch: r.s.baseBranch, baseBranchMissing: r.s.baseBranchMissing,
       prs, prNumber, componentName: r.comp.name, componentType: r.comp.type, source: _prSource,
+      env: _prSource === 'promo' ? envOf(r.s) : '',
     });
   }
 
@@ -1846,6 +1898,7 @@ export class ReleaseCheckerPanel {
     const tally = document.getElementById('riskTally');
     if (components.length === 0) {
       tally.innerHTML = '';
+      document.getElementById('compSearchWrap').style.display = 'none';
       list.style.display = 'block';
       list.innerHTML = '<div class="no-common"><b>No shared components</b>Both sides touch completely separate metadata.</div>';
       return;
@@ -1921,6 +1974,8 @@ export class ReleaseCheckerPanel {
     list.innerHTML = '<nav class="comp-nav" aria-label="Shared components">' + navItems.join('') + '</div></nav><div class="comp-detail">' + details + '</div>';
     const keep = components.findIndex(c => c.type + '/' + c.name === _selectedKey);
     toggleComponent(keep >= 0 ? keep : 0);
+    document.getElementById('compSearchWrap').style.display = '';
+    filterComponents();
   }
 
   const RISK_LABEL = { high: 'Needs review', med: 'Check', low: 'Clear' };
