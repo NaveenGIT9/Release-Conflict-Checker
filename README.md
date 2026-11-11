@@ -2,6 +2,8 @@
 
 `sf-release-conflict-checker` — a VS Code extension that identifies common Salesforce metadata between releases or user stories and shows the Git diffs.
 
+**Guide:** [docs/Release-Overlap-Inspector-Guide.html](docs/Release-Overlap-Inspector-Guide.html) explains why bundling from UAT needs this check, how to set it up and how to read the results. Download it and open it in a browser.
+
 ## Install
 
 The packaged extension is committed in this repo: **`sf-release-conflict-checker-1.1.0.vsix`**.
