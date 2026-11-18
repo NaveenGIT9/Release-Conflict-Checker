@@ -196,12 +196,20 @@ function toStory(r: SfRecord): Story {
 function gitFileContent(branch: string, filePath: string, repoPath: string): string {
   // Try local branch first, then origin/
   for (const ref of [branch, `origin/${branch}`]) {
-    const r = spawnSync('git', ['show', `${ref}:${filePath}`], {
-      cwd: repoPath, encoding: 'utf8', shell: false,
-    });
-    if (r.status === 0) return r.stdout;
+    const r = readBlob(ref, filePath, repoPath);
+    if (r !== null) return r;
   }
   return ''; // file not found in either ref — treat as empty (new file in that branch)
+}
+
+// cat-file, not show: on Windows `git show <40-char sha>^:<path>` first stats the whole argument as a file,
+// which fails past MAX_PATH inside the deep clone folder, so show exits 128 and the left side came out empty.
+// The 64 MB buffer is for large permission sets/profiles (spawnSync's 1 MB default fails silently).
+function readBlob(ref: string, filePath: string, repoPath: string): string | null {
+  const r = spawnSync('git', ['cat-file', 'blob', `${ref}:${filePath}`], {
+    cwd: repoPath, encoding: 'utf8', shell: false, maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
 }
 
 // GitHub account per repo folder. With several accounts stored, Git Credential Manager otherwise asks which
@@ -238,10 +246,7 @@ function gitMergeBase(baseBranch: string, featureBranch: string, repoPath: strin
 }
 
 function gitFileContentAtRef(ref: string, filePath: string, repoPath: string): string {
-  const r = spawnSync('git', ['show', `${ref}:${filePath}`], {
-    cwd: repoPath, encoding: 'utf8', shell: false,
-  });
-  return r.status === 0 ? r.stdout : '';
+  return readBlob(ref, filePath, repoPath) ?? '';
 }
 
 function git(args: string[], repoPath: string, opts: { input?: string; env?: NodeJS.ProcessEnv } = {}): { ok: boolean; out: string } {
@@ -353,29 +358,26 @@ async function gitFetchRefspecsAsync(refspecs: string[], repoPath: string): Prom
 
 type StoryCommits = { commits: string[]; note?: string } | { error: string };
 
-// The story's own commits in a PR: reachable from the PR head, minus the story's base branch,
-// minus whatever the target branch already had when the PR was merged (or has now, if still open).
+// What a branch had before the PR head reached it. Excluding the branch as it is now would also drop the
+// story's own commits once they are promoted into it (e.g. a feature PR whose story is now in master).
+async function excludeBranch(ref: string, head: string, repoPath: string): Promise<string | null> {
+  if (!await gitRefExistsAsync(ref, repoPath)) return null;
+  if (!(await gitAsync(['merge-base', '--is-ancestor', head, ref], repoPath)).ok) return `^${ref}`;
+  // Copado lands PRs through promotion-branch merges, so find the oldest merge that brought the head in.
+  const merges = (await gitAsync(['log', ref, '--ancestry-path', '--merges', '--format=%H', `${head}..${ref}`], repoPath))
+    .out.trim().split('\n').filter(Boolean);
+  const landing = merges[merges.length - 1];
+  return landing ? `^${landing}^1` : null;
+}
+
+// The story's own commits in a PR: reachable from the PR head, minus what the story's base branch and the
+// PR's target branch had before the PR's commits reached them.
 async function prStoryCommits(pr: PullRequest, baseBranch: string, repoPath: string): Promise<StoryCommits> {
   const head = (await gitAsync(['rev-parse', '--verify', '--quiet', `refs/remotes/pr/${pr.number}^{commit}`], repoPath)).out.trim();
   if (!head) return { error: 'PR head could not be fetched from GitHub' };
 
-  const exclude: string[] = [];
-  const baseRef = `origin/${baseBranch}`;
-  if (await gitRefExistsAsync(baseRef, repoPath)) exclude.push(`^${baseRef}`);
-
-  const targetRef = pr.targetBranch ? `origin/${pr.targetBranch}` : '';
-  if (targetRef && await gitRefExistsAsync(targetRef, repoPath)) {
-    const inTarget = (await gitAsync(['merge-base', '--is-ancestor', head, targetRef], repoPath)).ok;
-    if (inTarget) {
-      // Copado lands PRs through promotion-branch merges, so find the oldest merge that brought the head in.
-      const merges = (await gitAsync(['log', targetRef, '--ancestry-path', '--merges', '--format=%H', `${head}..${targetRef}`], repoPath))
-        .out.trim().split('\n').filter(Boolean);
-      const landing = merges[merges.length - 1];
-      if (landing) exclude.push(`^${landing}^1`);
-    } else {
-      exclude.push(`^${targetRef}`);
-    }
-  }
+  const refs = [...new Set([`origin/${baseBranch}`, pr.targetBranch ? `origin/${pr.targetBranch}` : ''].filter(r => r !== 'origin/' && r))];
+  const exclude = [...new Set((await Promise.all(refs.map(ref => excludeBranch(ref, head, repoPath)))).filter((e): e is string => !!e))];
 
   const r = await gitAsync(['rev-list', '--no-merges', head, ...exclude], repoPath);
   if (!r.ok) return { error: 'could not list PR commits' };
@@ -505,7 +507,7 @@ function replayFileDiff(touching: string[], filePath: string, repoPath: string):
       break;
     }
     right = exact
-      ? git(['show', `:${filePath}`], repoPath, { env }).out
+      ? git(['cat-file', 'blob', `:${filePath}`], repoPath, { env }).out
       : gitFileContentAtRef(touching[touching.length - 1], filePath, repoPath);
   } finally {
     try { fs.unlinkSync(indexFile); } catch { /* never created */ }
@@ -1915,6 +1917,12 @@ export class ReleaseCheckerPanel {
   .comp-search input{flex:0 1 420px;width:100%;min-width:0;padding:7px 12px 7px 32px;border-radius:var(--r-sm);border:1px solid var(--glass-line);background:var(--glass) no-repeat 11px 50%/14px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237a97ad' stroke-width='1.6'%3E%3Ccircle cx='7' cy='7' r='5'/%3E%3Cpath d='M11 11l3.5 3.5' stroke-linecap='round'/%3E%3C/svg%3E");color:var(--fg);font:inherit;font-size:12.5px;outline:none}
   .comp-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent)}
   .comp-search-count{font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .story-search{display:flex;align-items:center;gap:8px;margin-left:auto;min-width:0}
+  .story-search input{width:210px;max-width:100%;min-width:0;padding:5px 10px 5px 28px;border-radius:var(--r-sm);border:1px solid var(--glass-line);background:var(--glass) no-repeat 9px 50%/13px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237a97ad' stroke-width='1.6'%3E%3Ccircle cx='7' cy='7' r='5'/%3E%3Cpath d='M11 11l3.5 3.5' stroke-linecap='round'/%3E%3C/svg%3E");color:var(--fg);font:inherit;font-size:12px;outline:none}
+  .story-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent)}
+  .story-search-count{font-size:11px;color:var(--muted);white-space:nowrap}
+  .story-empty{padding:10px 12px;font-size:12px;color:var(--muted)}
+  .story-row[hidden],.story-empty[hidden]{display:none}
   .comp-empty{padding:14px 10px;font-size:12px;color:var(--muted);text-align:center}
   .component-header mark{background:color-mix(in srgb, var(--accent) 22%, transparent);color:inherit;border-radius:3px;padding:0 1px}
   .no-common{padding:32px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:var(--r)}
@@ -2483,6 +2491,23 @@ export class ReleaseCheckerPanel {
     if (q && shown && !selectedShown) toggleComponent(firstShown);
   }
 
+  // Matches anywhere in the story name and its PR numbers, so "19913", "US-0019913", "11074" and "#11074" all work.
+  function filterStories(input) {
+    const box = input.closest('.component-stories');
+    const q = input.value.trim().toLowerCase();
+    const rows = box.querySelectorAll('.story-row');
+    let shown = 0;
+    rows.forEach(r => {
+      const hit = !q || r.dataset.find.indexOf(q) >= 0;
+      r.hidden = !hit;
+      if (hit) shown++;
+    });
+    input.parentElement.querySelector('.story-search-count').textContent = q ? shown + ' of ' + rows.length : '';
+    const empty = box.querySelector('.story-empty');
+    empty.hidden = shown > 0;
+    empty.textContent = 'No story or PR matches "' + input.value.trim() + '"';
+  }
+
   let _orgInstanceUrl = '';
   // Set by Connect until the new org's releases arrive; results of an analysis started before that are dropped.
   let _awaitingReleases = false;
@@ -2731,7 +2756,8 @@ export class ReleaseCheckerPanel {
     const details = components.map((comp, idx) => {
       const storyRows = comp.excludeStories.map(s => {
         const row = _rows.push({ s, comp }) - 1;
-        return '<div class="story-row">' +
+        const find = [s.name].concat(prsOf(s).map(p => '#' + p.number)).join(' ').toLowerCase();
+        return '<div class="story-row" data-find="' + esc(find) + '">' +
           '<div class="story-info">' +
             '<div class="story-top"><span class="story-name">' + storyNameHtml(s) + '</span>' +
               (s.releaseName ? '<span class="story-release-tag">' + esc(s.releaseName) + '</span>' : '') +
@@ -2767,8 +2793,9 @@ export class ReleaseCheckerPanel {
           '<div class="detail-head"><div><div class="detail-name">' + esc(comp.name) + '</div>' +
             '<div class="detail-sub"><span class="component-type">' + esc(comp.type) + '</span>' +
               n + ' stor' + (n === 1 ? 'y' : 'ies') + ' · ' + (withPr === 0 ? 'none' : withPr + ' of ' + n) + ' with a ' + (_prSource === 'promo' ? 'promotion ' : '') + 'PR</div></div>' +
+            (n > 1 ? '<div class="story-search"><input type="search" placeholder="Find US or PR number" autocomplete="off" spellcheck="false" aria-label="Find a story or PR in ' + esc(comp.name) + '" oninput="filterStories(this)"/><span class="story-search-count"></span></div>' : '') +
             '<span class="risk-pill ' + risk + '" title="' + tip + '">' + RISK_LABEL[risk] + '</span></div>' +
-          '<div class="timeline">' + storyRows + '</div>' +
+          '<div class="timeline">' + storyRows + '<div class="story-empty" hidden></div></div>' +
         '</div>';
     }).join('');
 
