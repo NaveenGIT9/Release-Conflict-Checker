@@ -22,6 +22,9 @@ interface SavedPrefs {
   mode?: 'release' | 'story';
   theme?: 'auto' | 'light' | 'dark';
   promoEnv?: string;         // '' = the story's next environment
+  compareBy?: 'release' | 'env';
+  envName?: string;          // Copado environment the bundle is taken from
+  pipeline?: string;         // Copado pipeline name whose environments are offered
 }
 
 interface PromoEnvResult {
@@ -54,6 +57,7 @@ interface Story {
   promoNote?: string;        // set when the story has no forward promotion at all
   promoLookupFailed?: boolean;
   nextEnv?: string;
+  movedBack?: { now: string; env: string; promotion: string; deployedAt: string };
 }
 
 interface CommonComponent {
@@ -200,9 +204,19 @@ function gitFileContent(branch: string, filePath: string, repoPath: string): str
   return ''; // file not found in either ref — treat as empty (new file in that branch)
 }
 
+// GitHub account per repo folder. With several accounts stored, Git Credential Manager otherwise asks which
+// one to use on every fetch; an entry also means fetches must never prompt ('' = no account has access).
+const gitAccounts = new Map<string, string>();
+const QUIET_GIT_ENV = { ...process.env, GCM_INTERACTIVE: 'never', GIT_TERMINAL_PROMPT: '0' };
+const netArgs = (repoPath: string, args: string[]): string[] => {
+  const user = gitAccounts.get(repoPath);
+  return user ? ['-c', `credential.username=${user}`, ...args] : args;
+};
+const netEnv = (repoPath: string): NodeJS.ProcessEnv | undefined => gitAccounts.has(repoPath) ? QUIET_GIT_ENV : undefined;
+
 function gitFetchBranch(branch: string, repoPath: string): void {
-  spawnSync('git', ['fetch', 'origin', branch], {
-    cwd: repoPath, encoding: 'utf8', shell: false,
+  spawnSync('git', netArgs(repoPath, ['fetch', 'origin', branch]), {
+    cwd: repoPath, encoding: 'utf8', shell: false, env: netEnv(repoPath),
   });
 }
 
@@ -241,29 +255,109 @@ function gitRefExists(ref: string, repoPath: string): boolean {
   return git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], repoPath).ok;
 }
 
-function gitFetchRefspecs(refspecs: string[], repoPath: string): void {
-  if (refspecs.length === 0) return;
-  if (git(['fetch', 'origin', ...refspecs], repoPath).ok) return;
-  // One missing ref fails the whole batch — retry individually so the rest still land.
-  for (const spec of refspecs) git(['fetch', 'origin', spec], repoPath);
+// Non-blocking git for work that runs many commands (PR checks, fetches), capped so a component
+// with many stories doesn't start dozens of git processes at once.
+const MAX_PARALLEL_GIT = 6;
+let gitActive = 0;
+const gitWaiters: Array<() => void> = [];
+
+const gitChildren = new Set<ReturnType<typeof spawn>>();
+let gitStopped = false;
+
+// Closing the panel must not leave fetches running (each one can raise a credential prompt).
+function stopAllGit(): void {
+  gitStopped = true;
+  for (const p of gitChildren) {
+    if (process.platform === 'win32' && p.pid) spawn('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true });
+    else p.kill();
+  }
+  gitChildren.clear();
+  gitWaiters.splice(0).forEach(r => r());
 }
+
+async function gitAsync(args: string[], repoPath: string, input?: string, env?: NodeJS.ProcessEnv): Promise<{ ok: boolean; code: number; out: string; err: string }> {
+  while (gitActive >= MAX_PARALLEL_GIT && !gitStopped) await new Promise<void>(r => gitWaiters.push(r));
+  if (gitStopped) return { ok: false, code: -1, out: '', err: 'stopped' };
+  gitActive++;
+  try {
+    return await new Promise(resolve => {
+      const p = spawn('git', args, { cwd: repoPath, shell: false, env, windowsHide: true });
+      gitChildren.add(p);
+      let out = '';
+      let err = '';
+      p.stdout.setEncoding('utf8');
+      p.stdout.on('data', (d: string) => { out += d; });
+      p.stderr.setEncoding('utf8');
+      p.stderr.on('data', (d: string) => { if (err.length < 4000) err += d; });
+      p.stdin.on('error', () => { /* git exited before reading all input */ });
+      p.on('error', () => { gitChildren.delete(p); resolve({ ok: false, code: -1, out: '', err: 'spawn failed' }); });
+      p.on('close', code => { gitChildren.delete(p); resolve({ ok: code === 0, code: code ?? -1, out, err }); });
+      p.stdin.end(input ?? '');
+    });
+  } finally {
+    gitActive--;
+    gitWaiters.shift()?.();
+  }
+}
+
+// Picks the GitHub account for a repo folder without any prompt: the user in the remote URL if set, else
+// the remembered one if it still works, else the first stored account that can read the repo.
+// null = leave git alone (zero or one stored account, so Git Credential Manager has nothing to ask).
+async function chooseGitAccount(repoPath: string, remembered: string): Promise<string | null> {
+  const origin = (await gitAsync(['remote', 'get-url', 'origin'], repoPath)).out.trim();
+  const inUrl = origin.match(/^https?:\/\/([^@/:]+)(?::[^@/]*)?@/)?.[1];
+  if (inUrl) return decodeURIComponent(inUrl);
+  if (!/^https?:\/\//i.test(origin)) return null;
+  const listed = (await gitAsync(['credential-manager', 'github', 'list'], repoPath, undefined, QUIET_GIT_ENV)).out
+    .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (listed.length < 2) return null;
+  const candidates = [...new Set([remembered, ...listed].filter(u => u && listed.includes(u)))];
+  for (const user of candidates) {
+    if (gitStopped) return null;
+    const r = await gitAsync(['-c', `credential.username=${user}`, 'ls-remote', 'origin', 'HEAD'], repoPath, undefined, QUIET_GIT_ENV);
+    if (r.ok) return user;
+  }
+  return '';
+}
+
+const AUTH_FAILURE =/authentication failed|could not read username|terminal prompts disabled|repository not found|returned error: 40[13]|permission denied/i;
+
+const gitRefExistsAsync = async (ref: string, repoPath: string): Promise<boolean> =>
+  (await gitAsync(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], repoPath)).ok;
+
+async function gitFetchRefspecsAsync(refspecs: string[], repoPath: string): Promise<void> {
+  if (refspecs.length === 0) return;
+  const batch = await gitAsync(netArgs(repoPath, ['fetch', 'origin', ...refspecs]), repoPath, undefined, netEnv(repoPath));
+  if (batch.ok || gitStopped) return;
+  if (AUTH_FAILURE.test(batch.err)) {
+    log(`git fetch failed on credentials, not retrying per ref: ${batch.err.trim().slice(0, 300)}`);
+    return;
+  }
+  // One missing ref fails the whole batch — retry individually so the rest still land.
+  for (const spec of refspecs) {
+    if (gitStopped) return;
+    await gitAsync(netArgs(repoPath, ['fetch', 'origin', spec]), repoPath, undefined, netEnv(repoPath));
+  }
+}
+
+type StoryCommits = { commits: string[]; note?: string } | { error: string };
 
 // The story's own commits in a PR: reachable from the PR head, minus the story's base branch,
 // minus whatever the target branch already had when the PR was merged (or has now, if still open).
-function prStoryCommits(pr: PullRequest, baseBranch: string, repoPath: string): { commits: string[] } | { error: string } {
-  const head = git(['rev-parse', '--verify', '--quiet', `refs/remotes/pr/${pr.number}^{commit}`], repoPath).out.trim();
+async function prStoryCommits(pr: PullRequest, baseBranch: string, repoPath: string): Promise<StoryCommits> {
+  const head = (await gitAsync(['rev-parse', '--verify', '--quiet', `refs/remotes/pr/${pr.number}^{commit}`], repoPath)).out.trim();
   if (!head) return { error: 'PR head could not be fetched from GitHub' };
 
   const exclude: string[] = [];
   const baseRef = `origin/${baseBranch}`;
-  if (gitRefExists(baseRef, repoPath)) exclude.push(`^${baseRef}`);
+  if (await gitRefExistsAsync(baseRef, repoPath)) exclude.push(`^${baseRef}`);
 
   const targetRef = pr.targetBranch ? `origin/${pr.targetBranch}` : '';
-  if (targetRef && gitRefExists(targetRef, repoPath)) {
-    const inTarget = git(['merge-base', '--is-ancestor', head, targetRef], repoPath).ok;
+  if (targetRef && await gitRefExistsAsync(targetRef, repoPath)) {
+    const inTarget = (await gitAsync(['merge-base', '--is-ancestor', head, targetRef], repoPath)).ok;
     if (inTarget) {
       // Copado lands PRs through promotion-branch merges, so find the oldest merge that brought the head in.
-      const merges = git(['log', targetRef, '--ancestry-path', '--merges', '--format=%H', `${head}..${targetRef}`], repoPath)
+      const merges = (await gitAsync(['log', targetRef, '--ancestry-path', '--merges', '--format=%H', `${head}..${targetRef}`], repoPath))
         .out.trim().split('\n').filter(Boolean);
       const landing = merges[merges.length - 1];
       if (landing) exclude.push(`^${landing}^1`);
@@ -272,7 +366,7 @@ function prStoryCommits(pr: PullRequest, baseBranch: string, repoPath: string): 
     }
   }
 
-  const r = git(['rev-list', '--no-merges', head, ...exclude], repoPath);
+  const r = await gitAsync(['rev-list', '--no-merges', head, ...exclude], repoPath);
   if (!r.ok) return { error: 'could not list PR commits' };
   log(`PR #${pr.number} head ${head.slice(0, 10)} excl [${exclude.join(' ')}] → ${r.out.trim().split('\n').filter(Boolean).length} commit(s)`);
   return { commits: r.out.trim().split('\n').filter(Boolean) };
@@ -282,13 +376,12 @@ const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 // In a promotion PR, the story arrives through Copado's "Merging feature/<story> to promotion/<P>" commit;
 // only that merge counts, so other stories in the same promotion stay out of the diff.
-function promoStoryCommits(pr: PullRequest, storyName: string, baseBranch: string, repoPath: string):
-  { commits: string[]; note?: string } | { error: string } {
-  const head = git(['rev-parse', '--verify', '--quiet', `refs/remotes/pr/${pr.number}^{commit}`], repoPath).out.trim();
+async function promoStoryCommits(pr: PullRequest, storyName: string, baseBranch: string, repoPath: string): Promise<StoryCommits> {
+  const head = (await gitAsync(['rev-parse', '--verify', '--quiet', `refs/remotes/pr/${pr.number}^{commit}`], repoPath)).out.trim();
   if (!head) return { error: 'PR head could not be fetched from GitHub' };
   const promo = pr.promotion ?? '';
   const pattern = `Merging feature/${reEscape(storyName)} to promotion/${reEscape(promo)}([^0-9A-Za-z]|$)`;
-  const found = git(['log', head, '-i', '-E', `--grep=${pattern}`, '--format=%H %P'], repoPath)
+  const found = (await gitAsync(['log', head, '-i', '-E', `--grep=${pattern}`, '--format=%H %P'], repoPath))
     .out.trim().split('\n').filter(Boolean).map(l => l.split(' '));
   const merges = found.filter(parts => parts.length > 2).map(parts => parts[0]);
   if (merges.length) {
@@ -297,15 +390,36 @@ function promoStoryCommits(pr: PullRequest, storyName: string, baseBranch: strin
   }
 
   // No true merge (fast-forward or a different message): fall back to the story's own commits in the PR.
-  const res = prStoryCommits(pr, baseBranch, repoPath);
+  const res = await prStoryCommits(pr, baseBranch, repoPath);
   if ('error' in res) return res;
   const nameRe = new RegExp(`^(${reEscape(storyName)}\\b|Merging feature/${reEscape(storyName)}\\b)`, 'i');
-  const commits = git(['log', '--no-walk', '--stdin', '--format=%H %s'], repoPath, { input: res.commits.join('\n') + '\n' })
+  const commits = (await gitAsync(['log', '--no-walk', '--stdin', '--format=%H %s'], repoPath, res.commits.join('\n') + '\n'))
     .out.trim().split('\n').filter(Boolean)
     .filter(l => nameRe.test(l.slice(l.indexOf(' ') + 1)))
     .map(l => l.split(' ')[0]);
   if (commits.length === 0) return { error: `no merge of ${storyName} into promotion/${promo} found in the PR` };
   return { commits, note: `#${pr.number}: no merge commit for ${storyName} found, used commits named after the story` };
+}
+
+// Bundles are a folder of files, so a PR that only edits the LWC's HTML still counts as changing it.
+function touchPath(name: string, type: string): string {
+  if (type === 'LightningComponentBundle') return `force-app/main/default/lwc/${name}/`;
+  if (type === 'AuraDefinitionBundle') return `force-app/main/default/aura/${name}/`;
+  return getFilePath(name, type);
+}
+
+// Whether the given story commits change a path. Promotion merges are judged against their first parent
+// (what the merge brought in); git log's path filter can't be used for them. Unknown counts as a change.
+async function commitsTouch(commits: string[], filePath: string, source: 'feature' | 'promo', repoPath: string): Promise<boolean> {
+  if (commits.length === 0) return false;
+  if (source === 'feature') {
+    const r = await gitAsync(['log', '--no-walk', '--stdin', '--format=%H', '--', filePath], repoPath, commits.join('\n') + '\n');
+    return !r.ok || r.out.trim().length > 0;
+  }
+  for (const c of commits) {
+    if ((await gitAsync(['diff', '--quiet', `${c}^1`, c, '--', filePath], repoPath)).code !== 0) return true;
+  }
+  return false;
 }
 
 function byCommitTime(lines: string): string[] {
@@ -390,6 +504,8 @@ function getDefaultSfOrg(): string {
   return '';
 }
 
+const SF_ID = /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/;
+
 // ─── SF query via CLI ─────────────────────────────────────────────────────────
 
 function queryOrg(soql: string, orgAlias: string): SfRecord[] {
@@ -407,18 +523,55 @@ function queryOrg(soql: string, orgAlias: string): SfRecord[] {
   log(`stderr: ${(r.stderr ?? '').slice(0, 400)}`);
 
   if (r.error) throw new Error(`Failed to launch sf: ${r.error.message}`);
+  return parseQueryOutput(r.stdout, r.stderr, r.status);
+}
+
+function parseQueryOutput(stdout: string, stderr: string, status: number | null): SfRecord[] {
   // With --json, sf always writes the response as JSON to stdout even when it
   // exits non-zero due to unrelated warnings (ESM plugin, update notices in stderr).
   // Parse stdout first; only treat it as an error if the JSON itself says so.
   try {
-    const parsed = JSON.parse(r.stdout) as { status?: number; result?: { records?: SfRecord[] }; message?: string };
+    const parsed = JSON.parse(stdout) as { status?: number; result?: { records?: SfRecord[] }; message?: string };
     if (parsed?.result?.records !== undefined) return parsed.result.records;
     if (parsed?.message) throw new Error(parsed.message);
   } catch (e) {
     if (!(e instanceof SyntaxError)) throw e;
   }
-  throw new Error(r.stderr || r.stdout || `SF query failed (exit ${r.status})`);
+  throw new Error(stderr || stdout || `SF query failed (exit ${status})`);
 }
+
+// Same as queryOrg but does not block the extension host, so several can run side by side.
+function queryOrgAsync(soql: string, orgAlias: string): Promise<SfRecord[]> {
+  const sfArgs = ['data', 'query', '--query', soql, '--target-org', orgAlias, '--json'];
+  const [exe, args] = process.platform === 'win32'
+    ? ['cmd', ['/c', 'sf', ...sfArgs]] as const
+    : ['sf', sfArgs] as const;
+  log(`Spawn (async): ${exe} ${args.join(' ')}`);
+  return new Promise((resolve, reject) => {
+    const child = spawn(exe, args, { shell: false, windowsHide: true });
+    let out = '';
+    let err = '';
+    child.stdout.setEncoding('utf8').on('data', (d: string) => { out += d; });
+    child.stderr.setEncoding('utf8').on('data', (d: string) => { err += d; });
+    const timer = setTimeout(() => {
+      // Killing cmd.exe alone would leave the sf node process running.
+      if (process.platform === 'win32' && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+      else child.kill();
+      reject(new Error('SF query timed out after 60 seconds'));
+    }, 60_000);
+    child.on('error', e => { clearTimeout(timer); reject(new Error(`Failed to launch sf: ${e.message}`)); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      log(`Exit (async): ${code ?? 'null'} | stdout: ${out.slice(0, 300)} | stderr: ${err.slice(0, 200)}`);
+      try { resolve(parseQueryOutput(out, err, code)); } catch (e) { reject(e); }
+    });
+  });
+}
+
+// More would add little speed and each sf process takes ~200 MB on the VDI.
+const MAX_PARALLEL_QUERIES = 4;
+
+type Report = (done: number, total: number) => void;
 
 // ─── Panel ────────────────────────────────────────────────────────────────────
 
@@ -452,6 +605,7 @@ export class ReleaseCheckerPanel {
 
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
     this.panel = panel;
+    gitStopped = false;
     this.logoUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'icon.png')).toString();
     // Pre-fill: saved alias first, fall back to sf config default org
     const saved    = ReleaseCheckerPanel.context?.globalState.get<string>('lastOrgAlias') ?? '';
@@ -509,8 +663,56 @@ export class ReleaseCheckerPanel {
     });
   }
 
-  private post(data: Record<string, unknown>): void {
-    void this.panel.webview.postMessage(data);
+  private post(data: Record<string, unknown>): Thenable<boolean> {
+    return this.panel.webview.postMessage(data);
+  }
+
+  private activeQueries = 0;
+  private queryWaiters: Array<() => void> = [];
+  private warm = false;
+
+  // Runs at most MAX_PARALLEL_QUERIES at once; until one has succeeded in this run they go one by one,
+  // so an expired login token is refreshed by a single sf process rather than several racing.
+  private async query(soql: string): Promise<SfRecord[]> {
+    while (this.activeQueries >= (this.warm ? MAX_PARALLEL_QUERIES : 1)) {
+      await new Promise<void>(r => this.queryWaiters.push(r));
+    }
+    this.activeQueries++;
+    try {
+      const records = await queryOrgAsync(soql, this.orgAlias);
+      this.warm = true;
+      return records;
+    } finally {
+      this.activeQueries--;
+      this.queryWaiters.splice(0).forEach(r => r());
+    }
+  }
+
+  // Each call starts the next step; the returned reporter posts real done/total counts for it.
+  private stepper(steps: number): (label: string, unit: 'story' | 'release' | 'query') => Report {
+    let n = 0;
+    return (label, unit) => {
+      const step = ++n;
+      return (done, total) => { void this.post({ type: 'progress', step, steps, label, unit, done, total }); };
+    };
+  }
+
+  // Runs fn over items in batches (in parallel, within the query limit) and returns results in input order.
+  // Progress is reported in items, so a batch of 50 stories moves the count by 50.
+  private async inBatches<T, R>(items: T[], size: number, report: Report | undefined, fn: (batch: T[]) => Promise<R>): Promise<R[]> {
+    const batches: T[][] = [];
+    for (let i = 0; i < items.length; i += size) batches.push(items.slice(i, i + size));
+    let done = 0;
+    report?.(0, items.length);
+    return Promise.all(batches.map(b => fn(b).then(r => {
+      done += b.length;
+      report?.(done, items.length);
+      return r;
+    })));
+  }
+
+  private async fetchStoriesForReleases(releaseIds: string[], report?: Report): Promise<Story[][]> {
+    return this.inBatches(releaseIds, 1, report, ([id]) => this.fetchStoriesForRelease(id));
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -524,6 +726,15 @@ export class ReleaseCheckerPanel {
           msg.excludeIds as string[],
           msg.excludeNames as string[]
         );
+        break;
+      case 'fetchPipelineEnvs':
+        this.fetchPipelineEnvironments(String(msg.pipelineId ?? ''));
+        break;
+      case 'analyseEnv':
+        await this.analyseAgainstEnv(msg.promoteIds as string[], String(msg.envId ?? ''), String(msg.envName ?? ''), String(msg.pipelineId ?? ''));
+        break;
+      case 'checkPrTouch':
+        await this.checkPrTouch(msg);
         break;
       case 'analyseStories':
         await this.analyseStories(msg.story1 as string, msg.story2 as string);
@@ -562,6 +773,9 @@ export class ReleaseCheckerPanel {
           mode: p.mode === 'story' ? 'story' : 'release',
           theme: p.theme === 'light' || p.theme === 'dark' ? p.theme : 'auto',
           promoEnv: typeof p.promoEnv === 'string' ? p.promoEnv.slice(0, 120) : '',
+          compareBy: p.compareBy === 'env' ? 'env' : 'release',
+          envName: typeof p.envName === 'string' ? p.envName.slice(0, 120) : '',
+          pipeline: typeof p.pipeline === 'string' ? p.pipeline.slice(0, 120) : '',
         };
         await ReleaseCheckerPanel.context?.globalState.update('savedPrefs', prefs);
         this.post({ type: 'prefsSaved', prefs });
@@ -613,8 +827,17 @@ export class ReleaseCheckerPanel {
         } catch { /* count failure is non-fatal */ }
       }
 
+      let pipelines: Array<{ id: string; name: string; active: boolean }> = [];
+      try {
+        pipelines = queryOrg('SELECT Id, Name, copado__Active__c FROM copado__Deployment_Flow__c ORDER BY Name LIMIT 200', orgAlias)
+          .map(r => ({ id: r['Id'], name: r['Name'], active: String(r['copado__Active__c']) === 'true' }));
+      } catch (e) {
+        log(`Pipeline lookup failed: ${String(e)}`);
+      }
+
       this.post({
         type: 'releases',
+        pipelines,
         orgInstanceUrl: this.orgInstanceUrl,
         releases: records.map(r => ({
           id: r['Id'],
@@ -631,30 +854,25 @@ export class ReleaseCheckerPanel {
   // ── Analyse two releases ────────────────────────────────────────────────────
 
   private async analyseReleases(promoteIds: string[], excludeIds: string[], excludeNames: string[]): Promise<void> {
-    this.post({ type: 'status', message: `Fetching stories for ${promoteIds.length} release(s) to promote…` });
+    this.resetRunCaches();
+    this.warm = false;
+    const step = this.stepper(6);
     try {
-      const promoteStories = promoteIds.flatMap(id => this.fetchStoriesForRelease(id));
-      const promoteMeta = this.fetchMetadataForStories(promoteStories.map(s => s.id));
+      const promoteStories = (await this.fetchStoriesForReleases(promoteIds, step('Fetching stories of the releases to promote', 'release'))).flat();
+      const promoteMeta = await this.fetchMetadataForStories(promoteStories.map(s => s.id), step(`Fetching components of ${promoteStories.length} stories to promote`, 'story'));
 
-      const allFutureStories: Story[] = [];
-      const allFutureMeta: Array<{ name: string; type: string; storyId: string }> = [];
-
-      for (let i = 0; i < excludeIds.length; i++) {
-        const relName = excludeNames[i] ?? excludeIds[i];
-        const stories = this.fetchStoriesForRelease(excludeIds[i]).map(s => ({ ...s, releaseName: relName }));
-        allFutureStories.push(...stories);
-        allFutureMeta.push(...this.fetchMetadataForStories(stories.map(s => s.id)));
-      }
-
-      this.post({ type: 'status', message: `Found ${promoteStories.length} stories across ${promoteIds.length} release(s) to promote, checking against ${allFutureStories.length} stories across ${excludeIds.length} future planned release(s). Fetching metadata…` });
+      const futureLists = await this.fetchStoriesForReleases(excludeIds, step('Fetching stories of the future planned releases', 'release'));
+      const allFutureStories: Story[] = futureLists.flatMap((list, i) => list.map(s => ({ ...s, releaseName: excludeNames[i] ?? excludeIds[i] })));
+      const allFutureMeta = await this.fetchMetadataForStories(allFutureStories.map(s => s.id), step(`Fetching components of ${allFutureStories.length} future-release stories`, 'story'));
 
       const common = this.findCommonComponents(promoteMeta, allFutureMeta, allFutureStories);
       const involved = common.flatMap(c => c.excludeStories);
+      const n = new Set(involved.map(s => s.id)).size;
+      const prStep = step(`Fetching pull requests of ${n} future-release stories`, 'story');
+      const promoStep = step(`Checking promotions and promotion PRs of ${n} stories`, 'story');
       if (involved.length > 0) {
-        this.post({ type: 'status', message: `Fetching pull requests for ${new Set(involved.map(s => s.id)).size} future-release stories…` });
-        this.attachPullRequests(involved);
-        this.post({ type: 'status', message: 'Checking promotions and promotion pull requests…' });
-        this.attachPromotionPullRequests(involved);
+        await this.attachPullRequests(involved, prStep);
+        await this.attachPromotionPullRequests(involved, promoStep);
       }
       this.post({ type: 'results', components: common, mode: 'release', orgInstanceUrl: this.orgInstanceUrl });
     } catch (e) {
@@ -662,10 +880,100 @@ export class ReleaseCheckerPanel {
     }
   }
 
+  private fetchPipelineEnvironments(pipelineId: string): void {
+    if (!SF_ID.test(pipelineId)) { this.post({ type: 'pipelineEnvs', pipelineId, environments: [] }); return; }
+    try {
+      const steps = queryOrg(
+        `SELECT copado__Source_Environment__c, copado__Source_Environment__r.Name, copado__Destination_Environment__c, copado__Destination_Environment__r.Name ` +
+        `FROM copado__Deployment_Flow_Step__c WHERE copado__Deployment_Flow__c = '${pipelineId}'`,
+        this.orgAlias
+      );
+      const names = new Map<string, string>();
+      const next = new Map<string, string>();
+      for (const s of steps) {
+        const src = val(s, 'copado__Source_Environment__c');
+        const dst = val(s, 'copado__Destination_Environment__c');
+        if (src) names.set(src, val(s, 'copado__Source_Environment__r.Name') || src);
+        if (dst) names.set(dst, val(s, 'copado__Destination_Environment__r.Name') || dst);
+        if (src && dst) next.set(src, dst);
+      }
+      // Hops to the end of the pipeline, so the list reads dev sandboxes first and production last.
+      const hops = (id: string): number => {
+        const seen = new Set<string>();
+        let cur = id;
+        while (next.has(cur) && !seen.has(cur)) { seen.add(cur); cur = next.get(cur)!; }
+        return seen.size;
+      };
+      const environments = [...names].map(([id, name]) => ({ id, name, hops: hops(id) }))
+        .sort((a, b) => b.hops - a.hops || a.name.localeCompare(b.name))
+        .map(({ id, name }) => ({ id, name }));
+      this.post({ type: 'pipelineEnvs', pipelineId, environments });
+    } catch (e) {
+      this.post({ type: 'error', message: `Failed to load the pipeline's environments: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+
+  // ── Analyse a release against everything else sitting in an environment ────
+
+  private async analyseAgainstEnv(promoteIds: string[], envId: string, envLabel: string, pipelineId: string): Promise<void> {
+    try {
+      if (!SF_ID.test(envId)) throw new Error('Please pick an environment.');
+      const ids = (promoteIds ?? []).filter(id => SF_ID.test(id));
+      if (ids.length === 0) throw new Error('No valid release to promote was selected.');
+      const envName = envLabel || 'the environment';
+      this.resetRunCaches();
+      this.warm = false;
+      const step = this.stepper(6);
+
+      const promoteStories = (await this.fetchStoriesForReleases(ids, step('Fetching stories of the releases to promote', 'release'))).flat();
+      const promoteMeta = await this.fetchMetadataForStories(promoteStories.map(s => s.id), step(`Fetching components of ${promoteStories.length} stories to promote`, 'story'));
+
+      const quoted = (list: string[]) => list.map(id => `'${id}'`).join(',');
+      const lookup = step(`Looking up stories sitting in ${envName} or moved back from it`, 'query');
+      lookup(0, 3);
+      let lookedUp = 0;
+      const tick = <T>(p: Promise<T>): Promise<T> => p.then(r => { lookup(++lookedUp, 3); return r; });
+      const [current, ownInEnv, movedBack] = await Promise.all([
+        tick(this.query(
+          `SELECT Id, Name, copado__Base_Branch__c, copado__View_in_Git__c, copado__Release__r.Name FROM copado__User_Story__c ` +
+          `WHERE copado__Environment__c = '${envId}' AND (copado__Release__c = null OR copado__Release__c NOT IN (${quoted(ids)}))`
+        )),
+        tick(this.query(`SELECT Id FROM copado__User_Story__c WHERE copado__Environment__c = '${envId}' AND copado__Release__c IN (${quoted(ids)})`)),
+        tick(this.fetchMovedBackStories(envId, envName, pipelineId, ids).catch(e => {
+          log(`Stories moved back lookup failed: ${String(e)}`);
+          return [] as Story[];
+        })),
+      ]);
+      const currentStories = current.map(r => ({ ...toStory(r), releaseName: val(r, 'copado__Release__r.Name') || 'No release' }));
+      const currentIds = new Set(currentStories.map(s => s.id));
+      const movedBackStories = movedBack.filter(s => !currentIds.has(s.id));
+      const envStories = [...currentStories, ...movedBackStories];
+      const envMeta = await this.fetchMetadataForStories(envStories.map(s => s.id), step(`Fetching components of ${envStories.length} stories sitting in ${envName}`, 'story'));
+
+      const common = this.findCommonComponents(promoteMeta, envMeta, envStories);
+      const involved = common.flatMap(c => c.excludeStories);
+      const n = new Set(involved.map(s => s.id)).size;
+      const prStep = step(`Fetching pull requests of ${n} ${envName} stories`, 'story');
+      const promoStep = step(`Checking promotions and promotion PRs of ${n} stories`, 'story');
+      if (involved.length > 0) {
+        await this.attachPullRequests(involved, prStep);
+        await this.attachPromotionPullRequests(involved, promoStep);
+      }
+      this.post({
+        type: 'results', components: common, mode: 'env', envName,
+        envStoryCount: currentStories.length, envOwnCount: ownInEnv.length, movedBackCount: movedBackStories.length,
+        orgInstanceUrl: this.orgInstanceUrl,
+      });
+    } catch (e) {
+      this.post({ type: 'error', message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   // ── Analyse two user stories directly ──────────────────────────────────────
 
   private async analyseStories(story1Name: string, story2Name: string): Promise<void> {
     this.post({ type: 'status', message: `Looking up stories ${story1Name} and ${story2Name}…` });
+    this.resetRunCaches();
     try {
       const records = queryOrg(
         `SELECT Id, Name, copado__Base_Branch__c, copado__View_in_Git__c FROM copado__User_Story__c WHERE Name IN ('${story1Name}','${story2Name}')`,
@@ -678,8 +986,8 @@ export class ReleaseCheckerPanel {
       const stories: Story[] = records.map(toStory);
 
       this.post({ type: 'status', message: 'Fetching metadata for both stories…' });
-      const meta1 = this.fetchMetadataForStories([stories[0].id]);
-      const meta2 = this.fetchMetadataForStories([stories[1].id]);
+      this.warm = true;
+      const [meta1, meta2] = await Promise.all([this.fetchMetadataForStories([stories[0].id]), this.fetchMetadataForStories([stories[1].id])]);
 
       // For story mode, both stories are the "exclude" stories on common components
       const story1Map = new Map(meta1.map(m => [`${m.type}:${m.name}`, m]));
@@ -700,9 +1008,9 @@ export class ReleaseCheckerPanel {
 
       if (common.length > 0) {
         this.post({ type: 'status', message: 'Fetching pull requests for both stories…' });
-        this.attachPullRequests(stories);
+        await this.attachPullRequests(stories);
         this.post({ type: 'status', message: 'Checking promotions and promotion pull requests…' });
-        this.attachPromotionPullRequests(stories);
+        await this.attachPromotionPullRequests(stories);
       }
       this.post({ type: 'results', components: common, mode: 'story', orgInstanceUrl: this.orgInstanceUrl });
     } catch (e) {
@@ -778,8 +1086,38 @@ export class ReleaseCheckerPanel {
   // ── Diff built from the story's own PR commits ──────────────────────────────
 
   // The story's own repo: an open workspace folder if it is that repo, otherwise a clone kept in extension storage.
-  private async resolveRepoPath(repoUrl: string): Promise<string> {
+  // A clone creates .git before it finishes, so a second caller mid-clone must wait on the same job.
+  private repoJobs = new Map<string, Promise<string>>();
+
+  private resolveRepoPath(repoUrl: string): Promise<string> {
     const wanted = normaliseRepoUrl(repoUrl);
+    let job = this.repoJobs.get(wanted);
+    if (!job) {
+      job = this.locateRepo(repoUrl, wanted).then(dir => this.pickAccount(dir));
+      job.catch(() => this.repoJobs.delete(wanted));
+      this.repoJobs.set(wanted, job);
+    }
+    return job;
+  }
+
+  private async pickAccount(dir: string): Promise<string> {
+    if (gitAccounts.has(dir)) return dir;
+    const store = ReleaseCheckerPanel.context?.globalState;
+    const saved = store?.get<Record<string, string>>('gitAccounts') ?? {};
+    const user = await chooseGitAccount(dir, saved[dir] ?? '');
+    if (user === null) return dir;
+    gitAccounts.set(dir, user);
+    if (user) {
+      log(`Using GitHub account ${user} for ${dir}`);
+      if (saved[dir] !== user) void store?.update('gitAccounts', { ...saved, [dir]: user });
+    } else {
+      log(`No stored GitHub account can read the repo in ${dir}; fetches will not prompt and PRs show as not checked`);
+      this.post({ type: 'notice', level: 'warn', message: 'None of your GitHub accounts could read this repo, so PRs could not be fetched. Check your access in GitHub.' });
+    }
+    return dir;
+  }
+
+  private async locateRepo(repoUrl: string, wanted: string): Promise<string> {
     if (!wanted) {
       const ws = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? '';
       if (!ws) throw new Error('Story has no GitHub link in Copado and no workspace folder is open.');
@@ -810,6 +1148,89 @@ export class ReleaseCheckerPanel {
       throw new Error(`Could not clone ${repoUrl}. Check you have access to it in GitHub (see "Release Overlap Inspector" output for details).`);
     }
     return dir;
+  }
+
+  // Per analysis run: refs already fetched and each PR's story commits, so selecting components or
+  // opening diffs repeatedly does no repeated GitHub or git work.
+  private fetched = new Map<string, Promise<void>>();
+  private commitCache = new Map<string, Promise<StoryCommits>>();
+
+  private resetRunCaches(): void {
+    this.fetched.clear();
+    this.commitCache.clear();
+  }
+
+  private async ensureFetched(repoPath: string, baseBranches: string[] | string, prs: PullRequest[]): Promise<void> {
+    const branches = new Set([...(Array.isArray(baseBranches) ? baseBranches : [baseBranches]), ...prs.map(p => p.targetBranch)].filter(Boolean));
+    const specs = [
+      ...[...branches].map(b => `+refs/heads/${b}:refs/remotes/origin/${b}`),
+      ...prs.map(p => `+refs/pull/${p.number}/head:refs/remotes/pr/${p.number}`),
+    ];
+    const missing = [...new Set(specs)].filter(s => !this.fetched.has(`${repoPath}|${s}`));
+    if (missing.length) {
+      const job = gitFetchRefspecsAsync(missing, repoPath);
+      missing.forEach(s => this.fetched.set(`${repoPath}|${s}`, job));
+    }
+    await Promise.all(specs.map(s => this.fetched.get(`${repoPath}|${s}`)));
+  }
+
+  private storyCommits(pr: PullRequest, storyName: string, baseBranch: string, source: 'feature' | 'promo', repoPath: string): Promise<StoryCommits> {
+    const key = [source, repoPath, storyName, baseBranch, pr.number, pr.promotion ?? '', pr.targetBranch].join('|');
+    let job = this.commitCache.get(key);
+    if (!job) {
+      job = source === 'promo' ? promoStoryCommits(pr, storyName, baseBranch, repoPath) : prStoryCommits(pr, baseBranch, repoPath);
+      this.commitCache.set(key, job);
+    }
+    return job;
+  }
+
+  // Which of each story's PRs change the component. A PR whose commits can't be read stays "unknown" so it
+  // is still offered; clicking it gives the real reason.
+  private async checkPrTouch(msg: Record<string, unknown>): Promise<void> {
+    try {
+      await this.runPrTouch(msg);
+    } catch (e) {
+      // Without a reply the rows would stay on "checking…"; an empty result offers every PR as before.
+      log(`PR check failed: ${String(e)}`);
+      this.post({ type: 'prTouch', key: msg.key, run: msg.run, results: {} });
+    }
+  }
+
+  private async runPrTouch(msg: Record<string, unknown>): Promise<void> {
+    const source = msg.source === 'promo' ? 'promo' : 'feature';
+    const componentName = String(msg.componentName ?? '');
+    const componentType = String(msg.componentType ?? '');
+    const stories = (msg.stories as Array<{ id: string; name: string; repoUrl: string; baseBranch: string; prs: PullRequest[] }>) ?? [];
+    const filePath = touchPath(componentName, componentType);
+    const results: Record<string, { touching: number[]; unknown: number[] }> = {};
+    const started = Date.now();
+
+    const byRepo = new Map<string, typeof stories>();
+    for (const s of stories) {
+      const repo = s.repoUrl || repoUrlFrom(s.prs.find(p => p.url)?.url ?? '');
+      byRepo.set(repo, [...(byRepo.get(repo) ?? []), s]);
+    }
+
+    await Promise.all([...byRepo].map(async ([repo, list]) => {
+      let repoPath = '';
+      try { repoPath = await this.resolveRepoPath(repo); } catch (e) { log(`PR check: ${String(e)}`); }
+      const inRepo = list.map(s => ({ s, split: splitByRepo(repo, s.prs) }));
+      if (repoPath) await this.ensureFetched(repoPath, list.map(s => s.baseBranch), inRepo.flatMap(x => x.split.prs));
+      await Promise.all(inRepo.map(async ({ s, split }) => {
+        const r = results[s.id] = { touching: [] as number[], unknown: s.prs.filter(p => !split.prs.includes(p)).map(p => p.number) };
+        await Promise.all(split.prs.map(async pr => {
+          if (!repoPath) { r.unknown.push(pr.number); return; }
+          const res = await this.storyCommits(pr, s.name, s.baseBranch, source, repoPath);
+          if ('error' in res) { r.unknown.push(pr.number); return; }
+          // A fallback to plain story commits (no promotion merge found) is judged like a feature PR.
+          if (await commitsTouch(res.commits, filePath, res.note ? 'feature' : source, repoPath)) r.touching.push(pr.number);
+        }));
+      }));
+    }));
+
+    log(`PR check ${componentType} ${componentName} (${source}) in ${Date.now() - started} ms: ` +
+      Object.entries(results).map(([id, r]) => `${stories.find(s => s.id === id)?.name}: touching [${r.touching.join(',')}] unknown [${r.unknown.join(',')}]`).join('; '));
+    this.post({ type: 'prTouch', key: msg.key, run: msg.run, results });
   }
 
   private async openPrDiff(
@@ -848,11 +1269,7 @@ export class ReleaseCheckerPanel {
     const filePath = getFilePath(componentName, componentType);
 
     this.post({ type: 'status', message: `Fetching ${prLabel} and ${baseBranch} from GitHub…` });
-    const branches = [...new Set([baseBranch, ...prs.map(p => p.targetBranch).filter(Boolean)])];
-    gitFetchRefspecs([
-      ...branches.map(b => `+refs/heads/${b}:refs/remotes/origin/${b}`),
-      ...prs.map(p => `+refs/pull/${p.number}/head:refs/remotes/pr/${p.number}`),
-    ], repoPath);
+    await this.ensureFetched(repoPath, baseBranch, prs);
 
     const warnings: string[] = [...oldRepoNotes];
     if (baseBranchMissing) warnings.push(`${storyName} has no base branch set; used master`);
@@ -865,15 +1282,9 @@ export class ReleaseCheckerPanel {
     const failed: string[] = [];
     let usedMerges = source === 'promo';
     for (const pr of prs) {
-      if (source === 'promo') {
-        const res = promoStoryCommits(pr, storyName, baseBranch, repoPath);
-        if ('error' in res) { failed.push(`#${pr.number}: ${res.error}`); continue; }
-        if (res.note) { warnings.push(res.note); usedMerges = false; }
-        res.commits.forEach(c => commits.add(c));
-        continue;
-      }
-      const res = prStoryCommits(pr, baseBranch, repoPath);
+      const res = await this.storyCommits(pr, storyName, baseBranch, source, repoPath);
       if ('error' in res) { failed.push(`#${pr.number}: ${res.error}`); continue; }
+      if (res.note) { warnings.push(res.note); usedMerges = false; }
       res.commits.forEach(c => commits.add(c));
     }
     if (failed.length === prs.length) {
@@ -889,7 +1300,11 @@ export class ReleaseCheckerPanel {
       ? mergeCommitsFileDiff([...commits], filePath, repoPath)
       : storyOnlyFileDiff([...commits], filePath, repoPath);
     if (!d) {
-      const msg = `${prLabel} (${commits.size} ${unit}${commits.size === 1 ? '' : 's'}) do${prs.length === 1 ? 'es' : ''} not change ${componentName} (${componentType}) — checked ${filePath}.`;
+      const bundle = touchPath(componentName, componentType);
+      const otherFiles = bundle !== filePath && await commitsTouch([...commits], bundle, usedMerges ? 'promo' : 'feature', repoPath);
+      const msg = otherFiles
+        ? `${prLabel} change${prs.length === 1 ? 's' : ''} other files of the ${componentName} bundle (${bundle}), but not ${filePath.split('/').pop()}, which is the file the diff shows.`
+        : `${prLabel} (${commits.size} ${unit}${commits.size === 1 ? '' : 's'}) do${prs.length === 1 ? 'es' : ''} not change ${componentName} (${componentType}) — checked ${filePath}.`;
       this.post({ type: 'notice', level: 'info', message: msg + (warnings.length ? ` Note: ${warnings.join('; ')}.` : '') });
       return;
     }
@@ -912,23 +1327,20 @@ export class ReleaseCheckerPanel {
 
   // ── Internal helpers ────────────────────────────────────────────────────────
 
-  private fetchStoriesForRelease(releaseId: string): Story[] {
-    const records = queryOrg(
-      `SELECT Id, Name, copado__Base_Branch__c, copado__View_in_Git__c FROM copado__User_Story__c WHERE copado__Release__c = '${releaseId}'`,
-      this.orgAlias
+  private async fetchStoriesForRelease(releaseId: string): Promise<Story[]> {
+    const records = await this.query(
+      `SELECT Id, Name, copado__Base_Branch__c, copado__View_in_Git__c FROM copado__User_Story__c WHERE copado__Release__c = '${releaseId}'`
     );
     return records.map(toStory);
   }
 
   // Mutates the stories in place so every component row sharing a story sees the same PR list.
-  private attachPullRequests(stories: Story[]): void {
+  private async attachPullRequests(stories: Story[], report?: Report): Promise<void> {
     const unique = [...new Map(stories.map(s => [s.id, s])).values()];
-    for (let i = 0; i < unique.length; i += 50) {
-      const batch = unique.slice(i, i + 50);
+    await this.inBatches(unique, 50, report, async batch => {
       try {
-        const records = queryOrg(
-          `SELECT copado__User_Story__c, copado__Request_Number__c, copado__State__c, copado__Merged__c, copado__Target_Branch__c, copado__Url__c FROM copado__Pull_Request__c WHERE copado__User_Story__c IN (${batch.map(s => `'${s.id}'`).join(',')}) ORDER BY copado__Request_Number__c`,
-          this.orgAlias
+        const records = await this.query(
+          `SELECT copado__User_Story__c, copado__Request_Number__c, copado__State__c, copado__Merged__c, copado__Target_Branch__c, copado__Url__c FROM copado__Pull_Request__c WHERE copado__User_Story__c IN (${batch.map(s => `'${s.id}'`).join(',')}) ORDER BY copado__Request_Number__c`
         );
         for (const s of batch) s.prs = [];
         for (const r of records) {
@@ -950,21 +1362,111 @@ export class ReleaseCheckerPanel {
         log(`Pull request lookup failed: ${String(e)}`);
         for (const s of batch) s.prLookupFailed = true;
       }
+    });
+  }
+
+  // A promotion qualifies when its latest SFDX Promote and latest SFDX Deploy job executions both succeeded.
+  // deployedAt is when that successful deploy ran.
+  private async qualifyPromotions(promoIds: string[]): Promise<{ qualified: Map<string, string>; jobState: Map<string, string> }> {
+    const qualified = new Map<string, string>();
+    const jobState = new Map<string, string>();
+    const chunks: string[][] = [];
+    for (let j = 0; j < promoIds.length; j += 100) chunks.push(promoIds.slice(j, j + 100));
+    await Promise.all(chunks.map(async chunk => {
+      const ids = chunk.map(id => `'${id}'`).join(',');
+      // SFDX Promote jobs point at the promotion; SFDX Deploy jobs point at the promotion's Deployment record.
+      const jobs = await this.query(
+        `SELECT copado__Promotion__c, copado__Deployment__r.copado__Promotion__c, copado__Status__c, copado__Template__r.Name, copado__Template__r.copado__ApiName__c, CreatedDate FROM copado__JobExecution__c WHERE copado__Promotion__c IN (${ids}) OR copado__Deployment__r.copado__Promotion__c IN (${ids}) ORDER BY CreatedDate DESC`
+      );
+      const latest = new Map<string, { promote?: string; deploy?: string; deployedAt?: string }>();
+      for (const r of jobs) {
+        const id = val(r, 'copado__Promotion__c') || val(r, 'copado__Deployment__r.copado__Promotion__c');
+        const name = val(r, 'copado__Template__r.Name');
+        const api = val(r, 'copado__Template__r.copado__ApiName__c');
+        const entry = latest.get(id) ?? {};
+        if (entry.promote === undefined && isTemplate(name, api, 'promote')) entry.promote = val(r, 'copado__Status__c');
+        if (entry.deploy === undefined && isTemplate(name, api, 'deploy')) { entry.deploy = val(r, 'copado__Status__c'); entry.deployedAt = val(r, 'CreatedDate'); }
+        latest.set(id, entry);
+      }
+      for (const [id, e] of latest) {
+        const state = `latest SFDX Promote: ${e.promote ?? 'none'}, latest SFDX Deploy: ${e.deploy ?? 'none'}`;
+        log(`Promotion ${id}: ${state}`);
+        jobState.set(id, state);
+        if (e.promote === 'Successful' && e.deploy === 'Successful') qualified.set(id, e.deployedAt ?? '');
+      }
+    }));
+    return { qualified, jobState };
+  }
+
+  // Stories that were deployed into the environment by a qualifying forward promotion but have since been
+  // moved back to an earlier stage (e.g. UAT → DEV): their changes are still in the environment's org.
+  // Stories that moved on past the environment are left out.
+  private async fetchMovedBackStories(envId: string, envName: string, pipelineId: string, releaseIds: string[]): Promise<Story[]> {
+    if (!SF_ID.test(pipelineId)) { log('No pipeline id, so stories moved back were not looked up'); return []; }
+    const steps = await this.query(
+      `SELECT copado__Source_Environment__c, copado__Destination_Environment__c FROM copado__Deployment_Flow_Step__c WHERE copado__Deployment_Flow__c = '${pipelineId}'`
+    );
+    const next = new Map<string, string>();
+    for (const s of steps) {
+      const src = val(s, 'copado__Source_Environment__c');
+      const dst = val(s, 'copado__Destination_Environment__c');
+      if (src && dst) next.set(src, dst);
     }
+    const reachesEnv = (id: string): boolean => {
+      const seen = new Set<string>();
+      for (let cur = next.get(id); cur && !seen.has(cur); cur = next.get(cur)) {
+        if (cur === envId) return true;
+        seen.add(cur);
+      }
+      return false;
+    };
+    const upstream = [...next.keys()].filter(id => id !== envId && reachesEnv(id));
+    if (upstream.length === 0) return [];
+
+    const quoted = (list: string[]) => list.map(id => `'${id}'`).join(',');
+    const links = await this.query(
+      `SELECT copado__Promotion__c, copado__Promotion__r.Name, copado__User_Story__c, copado__User_Story__r.Name, copado__User_Story__r.copado__Base_Branch__c, ` +
+      `copado__User_Story__r.copado__View_in_Git__c, copado__User_Story__r.copado__Release__r.Name, copado__User_Story__r.copado__Environment__r.Name ` +
+      `FROM copado__Promoted_User_Story__c ` +
+      `WHERE copado__Promotion__r.copado__Destination_Environment__c = '${envId}' AND copado__Promotion__r.copado__Status__c = 'Completed' ` +
+      `AND copado__Promotion__r.copado__Back_Promotion__c = false AND copado__User_Story__r.copado__Environment__c IN (${quoted(upstream)}) ` +
+      `AND (copado__User_Story__r.copado__Release__c = null OR copado__User_Story__r.copado__Release__c NOT IN (${quoted(releaseIds)}))`
+    );
+    if (links.length === 0) return [];
+
+    const { qualified } = await this.qualifyPromotions([...new Set(links.map(r => val(r, 'copado__Promotion__c')))]);
+    const byStory = new Map<string, Story>();
+    for (const r of links) {
+      const promoId = val(r, 'copado__Promotion__c');
+      if (!qualified.has(promoId)) continue;
+      const deployedAt = qualified.get(promoId) ?? '';
+      const id = val(r, 'copado__User_Story__c');
+      const prev = byStory.get(id);
+      if (prev && (prev.movedBack?.deployedAt ?? '') >= deployedAt) continue;
+      const story = toStory({
+        Id: id,
+        Name: val(r, 'copado__User_Story__r.Name'),
+        copado__Base_Branch__c: val(r, 'copado__User_Story__r.copado__Base_Branch__c'),
+        copado__View_in_Git__c: val(r, 'copado__User_Story__r.copado__View_in_Git__c'),
+      });
+      story.releaseName = val(r, 'copado__User_Story__r.copado__Release__r.Name') || 'No release';
+      story.movedBack = { now: val(r, 'copado__User_Story__r.copado__Environment__r.Name') || 'an earlier environment', env: envName, promotion: val(r, 'copado__Promotion__r.Name'), deployedAt };
+      byStory.set(id, story);
+    }
+    log(`Stories moved back from ${envName}: ${[...byStory.values()].map(s => `${s.name} (now ${s.movedBack!.now}, ${s.movedBack!.promotion})`).join(', ') || 'none'}`);
+    return [...byStory.values()];
   }
 
   // Promotion PRs: for teams that raise a PR from each promotion branch instead of the feature branch.
   // Results are kept per destination environment so the webview can show the story's next environment
   // (default) or any environment the user picks. A promotion qualifies only when it is Completed and its
   // latest SFDX Promote and latest SFDX Deploy job executions both succeeded.
-  private attachPromotionPullRequests(stories: Story[]): void {
+  private async attachPromotionPullRequests(stories: Story[], report?: Report): Promise<void> {
     const unique = [...new Map(stories.map(s => [s.id, s])).values()];
-    for (let i = 0; i < unique.length; i += 50) {
-      const batch = unique.slice(i, i + 50);
+    await this.inBatches(unique, 50, report, async batch => {
       try {
-        const links = queryOrg(
-          `SELECT copado__User_Story__c, copado__Promotion__c, copado__Promotion__r.Name, copado__Promotion__r.copado__Status__c, copado__Promotion__r.CreatedDate, copado__Promotion__r.copado__Source_Environment__c, copado__Promotion__r.copado__Destination_Environment__c, copado__Promotion__r.copado__Destination_Environment__r.Name FROM copado__Promoted_User_Story__c WHERE copado__User_Story__c IN (${batch.map(s => `'${s.id}'`).join(',')}) AND copado__Promotion__r.copado__Back_Promotion__c = false ORDER BY copado__Promotion__r.CreatedDate`,
-          this.orgAlias
+        const links = await this.query(
+          `SELECT copado__User_Story__c, copado__Promotion__c, copado__Promotion__r.Name, copado__Promotion__r.copado__Status__c, copado__Promotion__r.CreatedDate, copado__Promotion__r.copado__Source_Environment__c, copado__Promotion__r.copado__Destination_Environment__c, copado__Promotion__r.copado__Destination_Environment__r.Name FROM copado__Promoted_User_Story__c WHERE copado__User_Story__c IN (${batch.map(s => `'${s.id}'`).join(',')}) AND copado__Promotion__r.copado__Back_Promotion__c = false ORDER BY copado__Promotion__r.CreatedDate`
         );
 
         // The story's first forward promotion leaves its origin environment and lands in the next pipeline stage.
@@ -994,32 +1496,7 @@ export class ReleaseCheckerPanel {
         }
 
         const promoIds = [...new Set(candidates.flatMap(c => c.promos.map(p => p.id)))];
-        const qualified = new Set<string>();
-        const jobState = new Map<string, string>();
-        for (let j = 0; j < promoIds.length; j += 100) {
-          const ids = promoIds.slice(j, j + 100).map(id => `'${id}'`).join(',');
-          // SFDX Promote jobs point at the promotion; SFDX Deploy jobs point at the promotion's Deployment record.
-          const jobs = queryOrg(
-            `SELECT copado__Promotion__c, copado__Deployment__r.copado__Promotion__c, copado__Status__c, copado__Template__r.Name, copado__Template__r.copado__ApiName__c FROM copado__JobExecution__c WHERE copado__Promotion__c IN (${ids}) OR copado__Deployment__r.copado__Promotion__c IN (${ids}) ORDER BY CreatedDate DESC`,
-            this.orgAlias
-          );
-          const latest = new Map<string, { promote?: string; deploy?: string }>();
-          for (const r of jobs) {
-            const id = val(r, 'copado__Promotion__c') || val(r, 'copado__Deployment__r.copado__Promotion__c');
-            const name = val(r, 'copado__Template__r.Name');
-            const api = val(r, 'copado__Template__r.copado__ApiName__c');
-            const entry = latest.get(id) ?? {};
-            if (entry.promote === undefined && isTemplate(name, api, 'promote')) entry.promote = val(r, 'copado__Status__c');
-            if (entry.deploy === undefined && isTemplate(name, api, 'deploy')) entry.deploy = val(r, 'copado__Status__c');
-            latest.set(id, entry);
-          }
-          for (const [id, e] of latest) {
-            const state = `latest SFDX Promote: ${e.promote ?? 'none'}, latest SFDX Deploy: ${e.deploy ?? 'none'}`;
-            log(`Promotion ${id}: ${state}`);
-            jobState.set(id, state);
-            if (e.promote === 'Successful' && e.deploy === 'Successful') qualified.add(id);
-          }
-        }
+        const { qualified, jobState } = await this.qualifyPromotions(promoIds);
 
         const okPromos = new Map<string, string>();
         for (const c of candidates) {
@@ -1037,9 +1514,8 @@ export class ReleaseCheckerPanel {
         const prsByPromo = new Map<string, PullRequest[]>();
         for (let j = 0; j < okIds.length; j += 100) {
           const ids = okIds.slice(j, j + 100).map(id => `'${id}'`).join(',');
-          const recs = queryOrg(
-            `SELECT copado__Promotion__c, copado__Request_Number__c, copado__State__c, copado__Merged__c, copado__Target_Branch__c, copado__Url__c FROM copado__Promotion_Pull_Request__c WHERE copado__Promotion__c IN (${ids}) ORDER BY copado__Request_Number__c`,
-            this.orgAlias
+          const recs = await this.query(
+            `SELECT copado__Promotion__c, copado__Request_Number__c, copado__State__c, copado__Merged__c, copado__Target_Branch__c, copado__Url__c FROM copado__Promotion_Pull_Request__c WHERE copado__Promotion__c IN (${ids}) ORDER BY copado__Request_Number__c`
           );
           for (const r of recs) {
             const id = val(r, 'copado__Promotion__c');
@@ -1070,29 +1546,24 @@ export class ReleaseCheckerPanel {
         log(`Promotion pull request lookup failed: ${String(e)}`);
         for (const s of batch) s.promoLookupFailed = true;
       }
-    }
+    });
   }
 
-  private fetchMetadataForStories(storyIds: string[]): Array<{ name: string; type: string; storyId: string }> {
+  private async fetchMetadataForStories(storyIds: string[], report?: Report): Promise<Array<{ name: string; type: string; storyId: string }>> {
     if (storyIds.length === 0) return [];
-    const all: Array<{ name: string; type: string; storyId: string }> = [];
     // Batch in groups of 50 to avoid query length limits
-    for (let i = 0; i < storyIds.length; i += 50) {
-      const batch = storyIds.slice(i, i + 50);
+    const perBatch = await this.inBatches(storyIds, 50, report, async batch => {
       const ids = batch.map(id => `'${id}'`).join(',');
-      const records = queryOrg(
-        `SELECT copado__Metadata_API_Name__c, copado__Type__c, copado__User_Story__c FROM copado__User_Story_Metadata__c WHERE copado__User_Story__c IN (${ids})`,
-        this.orgAlias
+      const records = await this.query(
+        `SELECT copado__Metadata_API_Name__c, copado__Type__c, copado__User_Story__c FROM copado__User_Story_Metadata__c WHERE copado__User_Story__c IN (${ids})`
       );
-      for (const r of records) {
-        all.push({
-          name: r['copado__Metadata_API_Name__c'] ?? '',
-          type: r['copado__Type__c'] ?? 'Unknown',
-          storyId: r['copado__User_Story__c'] ?? '',
-        });
-      }
-    }
-    return all;
+      return records.map(r => ({
+        name: r['copado__Metadata_API_Name__c'] ?? '',
+        type: r['copado__Type__c'] ?? 'Unknown',
+        storyId: r['copado__User_Story__c'] ?? '',
+      }));
+    });
+    return perBatch.flat();
   }
 
   private findCommonComponents(
@@ -1184,7 +1655,7 @@ export class ReleaseCheckerPanel {
     --focus:#2f86c4; --link:#1f6fae; --badge:rgba(47,134,196,.12); --badge-fg:#1f5f8f; --placeholder:#7896ad;
     --ok:#1f9d63; --warn:#c27c0e; --err:#d6455d; --info:#2f86c4; --promote:#2f86c4; --future:#0f8fa3;
     --pick-promote:#1f9d63; --pick-future:#c27c0e;
-    --r:16px; --r-sm:9px;
+    --r:16px; --r-sm:9px; color-scheme:light;
     --glass:rgba(255,255,255,.55); --glass-line:rgba(255,255,255,.95); --glass-shadow:inset 0 1px 0 #fff,0 10px 30px rgba(60,120,170,.10); --glass-blur:blur(20px) saturate(160%);
     --seg-on:#ffffff; --seg-on-fg:#1f5f8f;
   }
@@ -1196,7 +1667,7 @@ export class ReleaseCheckerPanel {
     --focus:#5aa9dc; --link:#7cc0ec; --badge:rgba(140,190,230,.16); --badge-fg:#cfe2f1; --placeholder:#6f8aa0;
     --ok:#4cc38a; --warn:#e0a63a; --err:#f07186; --info:#5aa9dc; --promote:#5aa9dc; --future:#3cc2d4;
     --pick-promote:#4cc38a; --pick-future:#e0a63a;
-    --r:16px; --r-sm:9px;
+    --r:16px; --r-sm:9px; color-scheme:dark;
     --glass:rgba(255,255,255,.045); --glass-line:rgba(255,255,255,.09); --glass-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 10px 30px rgba(0,0,0,.25); --glass-blur:blur(20px) saturate(140%);
     --seg-on:rgba(255,255,255,.13); --seg-on-fg:#ffffff;
   }
@@ -1222,6 +1693,8 @@ export class ReleaseCheckerPanel {
   input[type=text]:focus,input[type=search]:focus{border-color:var(--focus);outline:1px solid var(--focus);outline-offset:-1px}
   select{width:100%;background:var(--input);color:var(--input-fg);border:1px solid var(--input-line);border-radius:var(--r-sm);padding:4px 6px;font:inherit;outline:none}
   select:focus{border-color:var(--focus);outline:1px solid var(--focus);outline-offset:-1px}
+  /* The option popup is native and ignores the translucent --input, so give it a solid themed surface. */
+  option{background:var(--bg, var(--vscode-dropdown-background));color:var(--fg, var(--vscode-dropdown-foreground))}
   input::placeholder{color:var(--placeholder)}
   .org-input{font-family:var(--mono);padding-left:22px !important}
   .mono-input{font-family:var(--mono)}
@@ -1229,6 +1702,9 @@ export class ReleaseCheckerPanel {
   .tab{text-align:center;padding:4px;border-radius:calc(var(--r-sm) - 2px);cursor:pointer;color:var(--muted);user-select:none}
   .tab:hover{color:var(--fg);background:var(--hover)}
   .tab.active{background:var(--seg-on);color:var(--seg-on-fg);font-weight:600;box-shadow:0 1px 3px rgba(40,90,130,.15)}
+  .amber{--amb:var(--pick-future, var(--vscode-charts-yellow, #c27c0e))}
+  .lab.amber{color:var(--amb)}
+  .seg.amber .tab.active{color:var(--amb);background:color-mix(in srgb, var(--amb) 16%, transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--amb) 45%, transparent)}
   .pick-group.promote{--promote:var(--pick-promote, var(--vscode-charts-green, #388a34))}
   .pick-group.future{--future:var(--pick-future, var(--vscode-charts-yellow, #c27c0e))}
   .pick-group{--g:var(--promote);border:1px solid var(--line);border-left:3px solid var(--g);border-radius:var(--r-sm);padding:10px;background:color-mix(in srgb, var(--g) 5%, var(--glass))}
@@ -1274,6 +1750,13 @@ export class ReleaseCheckerPanel {
   .status-error{border-left-color:var(--err);background:color-mix(in srgb, var(--err) 10%, transparent)}
   .spinner{width:14px;height:14px;flex-shrink:0;border:2px solid color-mix(in srgb, var(--fg) 20%, transparent);border-top-color:var(--focus);border-radius:50%;animation:spin .7s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+  .status-body{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}
+  .prog[hidden]{display:none}
+  .prog{display:flex;flex-direction:column;gap:4px}
+  .prog-track{height:6px;border-radius:3px;background:color-mix(in srgb, var(--fg) 12%, transparent);overflow:hidden}
+  .prog-fill{height:100%;width:0;border-radius:3px;background:var(--focus);transition:width .35s ease}
+  .prog-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .prog-meta #progPct{color:var(--fg);font-weight:600}
   .empty{border:1px dashed var(--line);border-radius:var(--r);padding:48px 24px;text-align:center;color:var(--muted)}
   .empty b{display:block;color:var(--fg);font-size:14px;font-weight:600;margin-bottom:4px}
   .empty svg{display:block;margin:0 auto 12px;opacity:.6}
@@ -1303,6 +1786,14 @@ export class ReleaseCheckerPanel {
   .comp-nav{gap:10px;padding:0;background:none;border:0}
   .nav-sec{display:flex;flex-direction:column;gap:1px;padding:4px 5px 5px;border-radius:calc(var(--r) - 4px);background:var(--glass);border:1px solid var(--glass-line);box-shadow:var(--glass-shadow)}
   .nav-group{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 -5px 4px;padding:6px 14px 7px;font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--accent);border-bottom:1px solid var(--line)}
+  button.nav-group{width:calc(100% + 10px);background:none;border-top:0;border-left:0;border-right:0;font-family:inherit;cursor:pointer;text-align:left;border-radius:calc(var(--r) - 4px) calc(var(--r) - 4px) 0 0}
+  button.nav-group:hover{background:var(--hover)}
+  button.nav-group:focus-visible{outline:1px solid var(--focus);outline-offset:-1px}
+  .nav-group .nav-title{display:flex;align-items:center;gap:6px;min-width:0}
+  .nav-group .chev{flex-shrink:0;transition:transform .15s ease}
+  .nav-sec.collapsed .nav-group .chev{transform:rotate(-90deg)}
+  .nav-sec.collapsed .nav-group{margin-bottom:0;border-bottom-color:transparent;border-radius:calc(var(--r) - 4px)}
+  .comp-nav:not(.searching) .nav-sec.collapsed .component-header{display:none}
   .nav-count{min-width:18px;padding:0 6px;border-radius:99px;text-align:center;font-size:10px;letter-spacing:0;color:var(--accent);background:color-mix(in srgb, var(--accent) 13%, transparent)}
   .component-header:hover{background:var(--hover)}
   .component-header.on{background:var(--sel);box-shadow:0 3px 12px rgba(47,134,196,.14)}
@@ -1360,7 +1851,20 @@ export class ReleaseCheckerPanel {
   .no-common{padding:32px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:var(--r)}
   .no-common b{display:block;color:var(--ok);font-size:14px;margin-bottom:4px}
   .legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:8px}
-  .pr-pill,.story-release-tag{border-radius:6px}
+  .pr-pill,.story-release-tag,.moved-tag{border-radius:6px}
+  .pr-pill.pr-skip{opacity:.45;text-decoration:line-through}
+  .story-touch{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .touch-spin{width:10px;height:10px;border:2px solid color-mix(in srgb, var(--muted) 35%, transparent);border-top-color:var(--muted);border-radius:50%;animation:spin .8s linear infinite;flex:none}
+  .moved-tag{font-size:11px;color:var(--warn);border:1px dashed color-mix(in srgb, var(--warn) 55%, transparent);padding:0 7px}
+  .kpi-env{grid-column:span 2;display:flex;flex-direction:column;gap:2px;min-width:0}
+  .kpi-env .ec-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+  .kpi-env .ec-row b{display:inline;font-size:13px;font-weight:600}
+  .kpi-env .ec-sub b{color:var(--muted)}
+  .kpi-env .ec-add b{color:var(--warn)}
+  .kpi-env .ec-total{border-top:1px solid var(--glass-line);margin-top:3px;padding-top:4px}
+  .kpi-env .ec-total span{color:var(--fg);font-weight:600}
+  .kpi-env .ec-total b{font-size:18px}
+  @media (max-width:520px){.kpi-env{grid-column:auto}}
 
   @media (max-width:720px){
     .app{grid-template-columns:1fr}
@@ -1392,6 +1896,12 @@ export class ReleaseCheckerPanel {
 
   <div id="modeCard" class="stack" style="display:none">
     <div>
+      <label class="lab" for="pipelineSel">Pipeline</label>
+      <select id="pipelineSel" onchange="onPipelinePick(this.value)"></select>
+      <div class="pick-hint" style="margin:5px 0 0">Its environments are offered under Compare against › Bundled environment</div>
+    </div>
+
+    <div>
       <div class="lab">Mode</div>
       <div class="seg">
         <div class="tab active" id="tabRelease" onclick="switchMode('release')">By release</div>
@@ -1401,13 +1911,13 @@ export class ReleaseCheckerPanel {
 
     <div>
       <div class="lab">PR source</div>
-      <div class="seg">
+      <div class="seg amber">
         <div class="tab active" id="srcFeature" onclick="setPrSource('feature')" title="PRs raised from the story's feature branch">Feature branch</div>
         <div class="tab" id="srcPromo" onclick="setPrSource('promo')" title="PRs raised from promotion branches into the story's next environment">Promotion</div>
       </div>
       <div class="pick-hint" id="srcHint" style="margin:5px 0 0">PRs raised from each story's feature branch</div>
       <div id="envPick" style="display:none;margin-top:8px">
-        <label class="lab" for="promoEnvSel">Target environment</label>
+        <label class="lab amber" for="promoEnvSel">PR target environment</label>
         <select id="promoEnvSel" onchange="setPromoEnv(this.value)"></select>
         <div class="pick-hint" id="envHint" style="margin:5px 0 0"></div>
       </div>
@@ -1420,7 +1930,19 @@ export class ReleaseCheckerPanel {
         <input type="search" id="promoteFilter" class="pick-filter" placeholder="Filter releases" oninput="renderPick('promote')"/>
         <div class="pick-list" id="promoteList" onchange="onPick(event, 'promote')"></div>
       </div>
-      <div class="pick-group future">
+      <div>
+        <div class="lab amber">Compare against</div>
+        <div class="seg amber">
+          <div class="tab active" id="cmpRelease" onclick="setCompareBy('release')" title="Stories tagged to the future planned releases you pick">Future releases</div>
+          <div class="tab" id="cmpEnv" onclick="setCompareBy('env')" title="Every other story currently sitting in the environment you bundle from">Environment</div>
+        </div>
+      </div>
+      <div class="pick-group future" id="envGroup" style="display:none">
+        <div class="lab"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5.5 14h5M8 11v3" stroke="currentColor" stroke-width="1.6"/></svg>Bundled environment</div>
+        <div class="pick-hint">Copado environment you bundle from. Its stories outside the releases to promote are checked.</div>
+        <select id="envSel" onchange="onEnvPick(this.value)"></select>
+      </div>
+      <div class="pick-group future" id="futureGroup">
         <div class="lab"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 5v3.2l2 1.3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Future planned releases <span class="cnt" id="futureCount"></span></div>
         <div class="pick-hint">Checked for overlap with the release being promoted</div>
         <input type="search" id="futureFilter" class="pick-filter" placeholder="Filter releases" oninput="renderPick('future')"/>
@@ -1456,7 +1978,13 @@ export class ReleaseCheckerPanel {
   </div>
   <div class="status-bar status-info" id="statusBar">
     <div class="spinner" id="statusSpinner"></div>
-    <span id="statusText"></span>
+    <div class="status-body">
+      <span id="statusText"></span>
+      <div class="prog" id="prog" hidden>
+        <div class="prog-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="progTrack"><div class="prog-fill" id="progFill"></div></div>
+        <div class="prog-meta"><span id="progPct"></span><span id="progCount"></span><span id="progEta"></span></div>
+      </div>
+    </div>
   </div>
 
   <div class="empty" id="emptyState">
@@ -1496,16 +2024,23 @@ export class ReleaseCheckerPanel {
   let currentTheme = SAVED.theme || (vscode.getState() || {}).theme || 'auto';
   let _prSource = (SAVED.prSource || (vscode.getState() || {}).prSource) === 'promo' ? 'promo' : 'feature';
   let _promoEnv = SAVED.promoEnv || '';
+  let _compareBy = SAVED.compareBy === 'env' ? 'env' : 'release';
+  // Kept by name so a saved choice survives reconnecting (and works across orgs with the same environment names).
+  let _envName = SAVED.envName || '';
+  let _environments = [];
+  let _pipelineName = SAVED.pipeline || '';
+  let _pipelines = [];
   let _last = null;
 
   function currentPrefs() {
-    return { prSource: _prSource, mode: currentMode, theme: currentTheme, promoEnv: _promoEnv };
+    return { prSource: _prSource, mode: currentMode, theme: currentTheme, promoEnv: _promoEnv, compareBy: _compareBy, envName: _envName, pipeline: _pipelineName };
   }
 
   function refreshPrefsState() {
     const cur = currentPrefs();
     const hasSaved = !!SAVED.prSource;
-    const same = hasSaved && cur.prSource === SAVED.prSource && cur.mode === SAVED.mode && cur.theme === SAVED.theme && cur.promoEnv === (SAVED.promoEnv || '');
+    const same = hasSaved && cur.prSource === SAVED.prSource && cur.mode === SAVED.mode && cur.theme === SAVED.theme && cur.promoEnv === (SAVED.promoEnv || '')
+      && cur.compareBy === (SAVED.compareBy || 'release') && cur.envName === (SAVED.envName || '') && cur.pipeline === (SAVED.pipeline || '');
     const btn = document.getElementById('btnSavePrefs');
     btn.disabled = same;
     document.getElementById('prefsState').textContent = same ? 'Settings saved' : hasSaved ? 'Unsaved changes' : '';
@@ -1527,6 +2062,47 @@ export class ReleaseCheckerPanel {
   const prsOf = s => (_prSource === 'promo' ? promoOf(s).prs : s.prs) || [];
   const lookupFailed = s => _prSource === 'promo' ? !!s.promoLookupFailed : !!s.prLookupFailed;
 
+  // Which PRs actually change a component is only known from git, so it is checked when a component is
+  // selected and kept per analysis run, PR source and picked environment.
+  let _run = 0;
+  const _touch = new Map();
+  const touchKey = comp => _run + '|' + _prSource + '|' + (_prSource === 'promo' ? _promoEnv || 'auto' : '') + '|' + comp.type + '/' + comp.name;
+  const touchState = (s, comp) => {
+    const t = _touch.get(touchKey(comp));
+    // Not checked yet counts as pending, so a row never shows PRs that turn out not to change the component.
+    if (!t || t.pending) return { pending: true };
+    const r = t.results[s.id];
+    return r ? { touching: new Set(r.touching), unknown: new Set(r.unknown) } : null;
+  };
+  // PRs worth offering for this component: those that change it, plus any that could not be checked.
+  const prsFor = (s, comp) => {
+    const prs = prsOf(s);
+    const t = touchState(s, comp);
+    if (t && t.pending) return [];
+    return !t ? prs : prs.filter(p => t.touching.has(p.number) || t.unknown.has(p.number));
+  };
+
+  function requestTouch(comp) {
+    if (!comp) return;
+    const key = touchKey(comp);
+    if (_touch.has(key)) return;
+    const stories = comp.excludeStories.filter(s => !lookupFailed(s) && prsOf(s).length)
+      .map(s => ({ id: s.id, name: s.name, repoUrl: s.repoUrl || '', baseBranch: s.baseBranch, prs: prsOf(s) }));
+    if (!stories.length) { _touch.set(key, { results: {} }); return; }
+    _touch.set(key, { pending: true });
+    vscode.postMessage({ command: 'checkPrTouch', key, run: _run, source: _prSource, componentName: comp.name, componentType: comp.type, stories });
+  }
+
+  function refreshTouchRows(key) {
+    _rows.forEach((r, i) => {
+      if (touchKey(r.comp) !== key) return;
+      const act = document.getElementById('act-' + i);
+      const info = document.getElementById('pri-' + i);
+      if (act) act.innerHTML = actionsHtml(i);
+      if (info) info.innerHTML = prInfoHtml(r.s, r.comp);
+    });
+  }
+
   function setPrSource(src) {
     _prSource = src === 'promo' ? 'promo' : 'feature';
     document.getElementById('srcFeature').classList.toggle('active', _prSource === 'feature');
@@ -1541,6 +2117,50 @@ export class ReleaseCheckerPanel {
     vscode.setState(Object.assign({}, vscode.getState() || {}, { prSource: _prSource }));
     refreshPrefsState();
     if (_last) renderResults(_last.components, _last.mode);
+  }
+
+  function setCompareBy(by) {
+    _compareBy = by === 'env' ? 'env' : 'release';
+    document.getElementById('cmpRelease').classList.toggle('active', _compareBy === 'release');
+    document.getElementById('cmpEnv').classList.toggle('active', _compareBy === 'env');
+    document.getElementById('futureGroup').style.display = _compareBy === 'release' ? '' : 'none';
+    document.getElementById('envGroup').style.display = _compareBy === 'env' ? '' : 'none';
+    renderReleasePickers();
+    refreshPrefsState();
+  }
+
+  function onEnvPick(id) {
+    const env = _environments.find(e => e.id === id);
+    _envName = env ? env.name : '';
+    renderCrumb();
+    refreshPrefsState();
+  }
+
+  function renderEnvironments(loading) {
+    const sel = document.getElementById('envSel');
+    const picked = _environments.find(e => e.name === _envName);
+    const empty = loading ? 'Loading environments…' : !_pipelineName ? 'Pick a pipeline first' : _environments.length ? 'Select an environment' : 'No environments in this pipeline';
+    sel.innerHTML = '<option value="">' + esc(empty) + '</option>' +
+      _environments.map(e => '<option value="' + esc(e.id) + '">' + esc(e.name) + '</option>').join('');
+    sel.value = picked ? picked.id : '';
+  }
+
+  function renderPipelines() {
+    const sel = document.getElementById('pipelineSel');
+    const picked = _pipelines.find(p => p.name === _pipelineName);
+    sel.innerHTML = '<option value="">' + (_pipelines.length ? 'Select a pipeline' : 'No pipelines found') + '</option>' +
+      _pipelines.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + (p.active ? '' : ' (inactive)') + '</option>').join('');
+    sel.value = picked ? picked.id : '';
+  }
+
+  function onPipelinePick(id) {
+    const p = _pipelines.find(x => x.id === id);
+    _pipelineName = p ? p.name : '';
+    _environments = [];
+    renderEnvironments(!!p);
+    if (p) vscode.postMessage({ command: 'fetchPipelineEnvs', pipelineId: p.id });
+    renderCrumb();
+    refreshPrefsState();
   }
 
   function setPromoEnv(env) {
@@ -1625,7 +2245,7 @@ export class ReleaseCheckerPanel {
     const other = list === 'promote' ? 'future' : 'promote';
     const q = (document.getElementById(list + 'Filter').value || '').trim().toLowerCase();
     const mine = new Set(_picked[list]);
-    const theirs = new Set(_picked[other]);
+    const theirs = new Set(_compareBy === 'env' ? [] : _picked[other]);
     const rows = _releases.filter(r => mine.has(r.id) || !q || releaseLabel(r).toLowerCase().includes(q))
       .sort((a, b) => Number(mine.has(b.id)) - Number(mine.has(a.id)));
     const otherName = list === 'promote' ? 'future' : 'promote';
@@ -1650,8 +2270,10 @@ export class ReleaseCheckerPanel {
     const el = document.getElementById('crumb');
     const nameOf = id => esc((_releases.find(r => r.id === id) || {}).name || id);
     if (currentMode !== 'release' || !_picked.promote.length) { el.innerHTML = ''; return; }
-    el.innerHTML = 'Promoting <span class="c-p">' + _picked.promote.map(nameOf).join(', ') + '</span>' +
-      (_picked.future.length ? ' against <span class="c-f">' + _picked.future.map(nameOf).join(', ') + '</span>' : '');
+    const against = _compareBy === 'env'
+      ? (_envName ? ' against other stories in <span class="c-f">' + esc(_envName) + '</span>' : '')
+      : (_picked.future.length ? ' against <span class="c-f">' + _picked.future.map(nameOf).join(', ') + '</span>' : '');
+    el.innerHTML = 'Promoting <span class="c-p">' + _picked.promote.map(nameOf).join(', ') + '</span>' + against;
   }
 
   function applyTheme(mode) {
@@ -1672,7 +2294,10 @@ export class ReleaseCheckerPanel {
   function toggleAll() {
     const btn = document.getElementById('btnToggleAll');
     const open = btn.textContent === 'Expand all';
-    if (open) document.querySelectorAll('.component-stories').forEach(el => el.classList.add('open'));
+    if (open) {
+      document.querySelectorAll('.component-stories').forEach(el => el.classList.add('open'));
+      _comps.forEach(requestTouch);
+    }
     else toggleComponent(_selected);
     btn.textContent = open ? 'Collapse all' : 'Expand all';
   }
@@ -1687,6 +2312,17 @@ export class ReleaseCheckerPanel {
     const excludeIds = [..._picked.future];
     const nameOf = id => (_releases.find(r => r.id === id) || {}).name || id;
     if (promoteIds.length === 0) { showStatus('Please add at least one Release to Promote.', 'error'); return; }
+    if (_compareBy === 'env') {
+      const env = _environments.find(e => e.name === _envName);
+      if (!_pipelineName) { showStatus('Please pick a pipeline first.', 'error'); return; }
+      if (!env) { showStatus('Please pick the environment you bundle from, e.g. RBKUAT.', 'error'); return; }
+      showStatus('Fetching the stories sitting in ' + env.name + '…', 'info', true);
+      showResultsArea(false);
+      document.getElementById('btnAnalyseReleases').disabled = true;
+      const pipeline = _pipelines.find(p => p.name === _pipelineName);
+      vscode.postMessage({ command: 'analyseEnv', promoteIds, envId: env.id, envName: env.name, pipelineId: pipeline ? pipeline.id : '' });
+      return;
+    }
     if (excludeIds.length === 0) { showStatus('Please add at least one Future Planned Release.', 'error'); return; }
     showStatus('Fetching stories and metadata for ' + promoteIds.length + ' release(s) to promote and ' + excludeIds.length + ' future planned release(s)…', 'info', true);
     showResultsArea(false);
@@ -1707,15 +2343,30 @@ export class ReleaseCheckerPanel {
 
   let _selected = 0;
   let _selectedKey = '';
+  let _comps = [];
 
-  function toggleComponent(id) {
+  function toggleComponent(id, reveal) {
     _selected = id;
     const hdr = document.querySelector('.component-header[data-idx="' + id + '"]');
     if (hdr) _selectedKey = hdr.dataset.key;
     document.querySelectorAll('.component-stories').forEach(el => el.classList.toggle('open', el.id === 'stories-' + id));
     document.querySelectorAll('.component-header').forEach(el => el.classList.toggle('on', el.dataset.idx === String(id)));
+    requestTouch(_comps[id]);
     const btn = document.getElementById('btnToggleAll');
     if (btn) btn.textContent = 'Expand all';
+    // Picking an item low in a long list leaves the page scrolled past the detail, so go back to the top.
+    if (reveal && window.scrollY > 0) window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // Survives re-renders (PR source / environment switches) so a collapsed type stays collapsed.
+  const _collapsedTypes = new Set();
+
+  function toggleType(btn) {
+    const sec = btn.closest('.nav-sec');
+    const shut = !sec.classList.contains('collapsed');
+    sec.classList.toggle('collapsed', shut);
+    btn.setAttribute('aria-expanded', String(!shut));
+    if (shut) _collapsedTypes.add(btn.dataset.type); else _collapsedTypes.delete(btn.dataset.type);
   }
 
   function filterComponents() {
@@ -1723,6 +2374,8 @@ export class ReleaseCheckerPanel {
     const nav = document.querySelector('.comp-nav');
     if (!input || !nav) return;
     const q = input.value.trim().toLowerCase();
+    // While searching, matches show even inside collapsed types.
+    nav.classList.toggle('searching', !!q);
     let shown = 0, total = 0, firstShown = null, selectedShown = false;
     nav.querySelectorAll('.nav-sec').forEach(sec => {
       let secShown = 0;
@@ -1800,7 +2453,8 @@ export class ReleaseCheckerPanel {
   function prDiff(row, prNumber) {
     const r = _rows[row];
     if (!r) return;
-    const prs = prsOf(r.s);
+    const prs = prsFor(r.s, r.comp);
+    if (!prs.length) return;
     const kind = _prSource === 'promo' ? 'promotion ' : '';
     const label = prNumber === null ? (prs.length > 1 ? 'all ' + kind + 'PRs' : kind + 'PR #' + prs[0].number) : kind + 'PR #' + prNumber;
     showStatus('Reading ' + label + ' for ' + r.comp.name + ' (' + r.s.name + ')…', 'info', true);
@@ -1817,7 +2471,7 @@ export class ReleaseCheckerPanel {
     if (r) viewDiff(r.s.name, r.s.baseBranch, r.s.featureBranch, r.comp.name, r.comp.type, r.s.repoUrl);
   }
 
-  function prInfoHtml(s) {
+  function prInfoHtml(s, comp) {
     const repo = s.repoUrl ? '<div class="story-branch">Repo: ' + esc(s.repoUrl.replace(/^https?:\\/\\/[^/]+\\//, '')) + '</div>' : '';
     const promo = _prSource === 'promo';
     const warn = repo + (s.baseBranchMissing && !promo ? '<div class="story-no-branch">⚠ No base branch on story — comparing with master</div>' : '');
@@ -1827,14 +2481,66 @@ export class ReleaseCheckerPanel {
     const via = pr && pr.promotions.length
       ? '<div class="story-branch">Promotions → ' + esc(pr.env) + ': ' + pr.promotions.map(esc).join(', ') + '</div>' : '';
     if (prs.length === 0) return warn + via + '<div class="story-no-pr">' + esc(pr ? (pr.note || 'No qualified promotions, hence no PRs shown') : 'No PR raised') + '</div>';
+    const t = comp ? touchState(s, comp) : null;
+    if (t && t.pending) return warn + via + '<div class="story-touch"><span class="touch-spin"></span>Checking which of ' + prs.length + ' PR' + (prs.length === 1 ? '' : 's') + ' change ' + esc(comp.name) + '…</div>';
+    const skipped = t ? prs.filter(p => !t.touching.has(p.number) && !t.unknown.has(p.number)) : [];
+    const note = skipped.length && skipped.length < prs.length
+        ? '<div class="story-touch">' + skipped.map(p => '#' + p.number).join(', ') + ' do' + (skipped.length === 1 ? 'es' : '') + ' not change ' + esc(comp.name) + '</div>'
+        : '';
     return warn + via + '<div class="story-prs">' + prs.map(p => {
       const state = p.merged ? 'Merged' : (p.state || 'Open');
-      const cls = 'pr-pill pr-' + String(state).toLowerCase();
+      const skip = skipped.includes(p);
+      const cls = 'pr-pill pr-' + String(state).toLowerCase() + (skip ? ' pr-skip' : '');
+      const tip = skip ? ' title="Does not change ' + esc(comp.name) + '"' : '';
       const text = '#' + p.number + (p.promotion ? ' ' + esc(p.promotion) : '') + ' ' + esc(String(state).toLowerCase()) + (p.targetBranch ? ' → ' + esc(p.targetBranch) : '');
       return /^https?:\\/\\//.test(p.url)
-        ? '<a href="#" class="' + cls + '" data-url="' + esc(p.url) + '" onclick="openUrl(this.dataset.url);return false;">' + text + '</a>'
-        : '<span class="' + cls + '">' + text + '</span>';
-    }).join('') + '</div>';
+        ? '<a href="#" class="' + cls + '"' + tip + ' data-url="' + esc(p.url) + '" onclick="openUrl(this.dataset.url);return false;">' + text + '</a>'
+        : '<span class="' + cls + '"' + tip + '>' + text + '</span>';
+    }).join('') + '</div>' + note;
+  }
+
+  function actionsHtml(row) {
+    const { s, comp } = _rows[row];
+    const promo = _prSource === 'promo';
+    const hasBranch = !!(s.featureBranch && s.featureBranch.length > 0);
+    const all = prsOf(s);
+    const branchBtn = tip => '<button class="btn btn-sm btn-pr" title="' + tip + '" onclick="branchDiff(' + row + ')">Branch Diff</button>';
+    if (all.length > 0) {
+      const t = touchState(s, comp);
+      if (t && t.pending) return '<span class="no-branch">Checking PRs…</span>';
+      const prs = prsFor(s, comp);
+      if (prs.length === 0) {
+        const none = '<span class="no-branch" title="Copado lists ' + esc(comp.name) + ' on this story, but none of its ' + (promo ? 'promotion ' : '') + 'PRs change it">No PR changes this component</span>';
+        return none + (!promo && hasBranch ? branchBtn('Feature branch vs base branch diff') : '');
+      }
+      return '<button class="btn btn-sm btn-diff" title="' + (promo ? 'Changes to this component from the story merges in the qualified promotion PRs that change it' : 'Changes to this component across the PRs that change it, story commits only') + '" onclick="prDiff(' + row + ',null)">' +
+          (prs.length > 1 ? 'All PRs Diff' : 'PR Diff' + (all.length > 1 ? ' #' + prs[0].number : '')) + '</button>' +
+        (prs.length > 1
+          ? prs.map(p => '<button class="btn btn-sm btn-pr" title="Only PR #' + p.number + (p.promotion ? ' (' + esc(p.promotion) + ')' : '') + '" onclick="prDiff(' + row + ',' + p.number + ')">#' + p.number + '</button>').join('')
+          : '');
+    }
+    if (promo) return '<span class="no-branch">No promotion PR</span>';
+    if (hasBranch) return branchBtn('No PR — falls back to the feature branch vs base branch diff');
+    return '<span class="no-branch">No branch</span>';
+  }
+
+  function envCountsHtml(envName) {
+    const others = _last.envStoryCount || 0, own = _last.envOwnCount || 0, moved = _last.movedBackCount || 0;
+    const line = (label, n, cls) => '<div class="ec-row' + (cls ? ' ' + cls : '') + '"><span>' + label + '</span><b>' + n + '</b></div>';
+    return '<div class="kpi kpi-env">' +
+      line('Stories sitting in ' + envName, others + own) +
+      line('Minus your releases\\' stories in ' + envName, '− ' + own, 'ec-sub') +
+      line('Other stories in ' + envName, others) +
+      line('Plus deployed to ' + envName + ' and moved back', '+ ' + moved, 'ec-add') +
+      line('Stories checked', others + moved, 'ec-total') +
+      '</div>';
+  }
+
+  function movedBackHtml(s) {
+    const m = s.movedBack;
+    if (!m) return '';
+    const day = m.deployedAt ? new Date(m.deployedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+    return '<div class="story-branch">Deployed to ' + esc(m.env) + ' by ' + esc(m.promotion) + (day ? ' on ' + esc(day) : '') + ', now in ' + esc(m.now) + '</div>';
   }
 
   function scrollToStatus() {
@@ -1848,6 +2554,36 @@ export class ReleaseCheckerPanel {
     bar.className = 'status-bar show status-' + (type || 'info');
     text.textContent = message;
     spin.style.display = spinner ? 'block' : 'none';
+    document.getElementById('prog').hidden = true;
+    _progStep = null;
+  }
+
+  // Real counts from the extension; the time left is only shown once this step has measured its own pace.
+  let _progStep = null;
+  function showProgress(m) {
+    const key = m.step + '|' + m.label;
+    const now = Date.now();
+    if (!_progStep || _progStep.key !== key) _progStep = { key, start: now, firstDone: null, firstAt: 0 };
+    if (m.done > 0 && _progStep.firstDone === null) { _progStep.firstDone = m.done; _progStep.firstAt = now; }
+    const keep = _progStep;
+    showStatus('Step ' + m.step + ' of ' + m.steps + ' · ' + m.label + '…', 'info', true);
+    _progStep = keep;
+    const pct = m.total ? Math.floor(m.done * 100 / m.total) : 0;
+    const prog = document.getElementById('prog');
+    prog.hidden = false;
+    document.getElementById('progFill').style.width = pct + '%';
+    document.getElementById('progTrack').setAttribute('aria-valuenow', String(pct));
+    document.getElementById('progPct').textContent = pct + '%';
+    const unit = m.unit === 'story' ? (m.total === 1 ? 'story' : 'stories') : m.unit === 'release' ? (m.total === 1 ? 'release' : 'releases') : (m.total === 1 ? 'query' : 'queries');
+    document.getElementById('progCount').textContent = m.done + ' of ' + m.total + ' ' + unit;
+    let eta = '';
+    const s = _progStep;
+    if (s && s.firstDone !== null && m.done > s.firstDone && m.done < m.total) {
+      const rate = (m.done - s.firstDone) / (now - s.firstAt);
+      const left = Math.ceil((m.total - m.done) / rate / 1000);
+      eta = '~' + (left >= 60 ? Math.floor(left / 60) + 'm ' + (left % 60) + 's' : left + 's') + ' left';
+    }
+    document.getElementById('progEta').textContent = eta;
   }
 
   function clearStatus() {
@@ -1889,10 +2625,12 @@ export class ReleaseCheckerPanel {
     const noPr = [...allStories.values()].filter(s => !lookupFailed(s) && !prsOf(s).length).length;
     const futureReleaseNames = [...new Set(components.flatMap(c => c.excludeStories.map(s => s.releaseName).filter(Boolean)))];
     const kpi = (n, label, cls) => '<div class="kpi' + (cls ? ' ' + cls : '') + '"><b>' + n + '</b><span>' + label + '</span></div>';
+    const envName = esc((_last && _last.envName) || 'environment');
     statRow.innerHTML =
       kpi(components.length, 'Shared components', components.length ? '' : 'ok') +
       (mode === 'release' ? kpi(futureReleaseNames.length, 'Future releases affected') : '') +
-      kpi(allStories.size, mode === 'story' ? 'Stories involved' : 'Future-release stories') +
+      (mode === 'env' ? envCountsHtml(envName) : '') +
+      kpi(allStories.size, mode === 'story' ? 'Stories involved' : mode === 'env' ? envName + ' stories involved' : 'Future-release stories') +
       kpi(noPr, _prSource === 'promo' ? 'Stories without a promotion PR' : 'Stories without a PR', noPr ? 'warn' : '');
 
     const tally = document.getElementById('riskTally');
@@ -1910,38 +2648,23 @@ export class ReleaseCheckerPanel {
     const typeCount = {};
     components.forEach(c => { typeCount[c.type] = (typeCount[c.type] || 0) + 1; });
 
+    _comps = components;
     _rows = [];
     const navItems = [];
     const counts = { high: 0, med: 0, low: 0 };
     const details = components.map((comp, idx) => {
       const storyRows = comp.excludeStories.map(s => {
-        const hasBranch = !!(s.featureBranch && s.featureBranch.length > 0);
-        const prs = prsOf(s);
-        const promo = _prSource === 'promo';
         const row = _rows.push({ s, comp }) - 1;
-        let actions;
-        if (prs.length > 0) {
-          actions =
-            '<button class="btn btn-sm btn-diff" title="' + (promo ? 'Changes to this component from the story merges in all qualified promotion PRs' : 'Changes to this component across all PRs, story commits only') + '" onclick="prDiff(' + row + ',null)">' +
-              (prs.length > 1 ? 'All PRs Diff' : 'PR Diff') + '</button>' +
-            (prs.length > 1
-              ? prs.map(p => '<button class="btn btn-sm btn-pr" title="Only PR #' + p.number + (p.promotion ? ' (' + esc(p.promotion) + ')' : '') + '" onclick="prDiff(' + row + ',' + p.number + ')">#' + p.number + '</button>').join('')
-              : '');
-        } else if (promo) {
-          actions = '<span class="no-branch">No promotion PR</span>';
-        } else if (hasBranch) {
-          actions = '<button class="btn btn-sm btn-pr" title="No PR — falls back to the feature branch vs base branch diff" onclick="branchDiff(' + row + ')">Branch Diff</button>';
-        } else {
-          actions = '<span class="no-branch">No branch</span>';
-        }
         return '<div class="story-row">' +
           '<div class="story-info">' +
             '<div class="story-top"><span class="story-name">' + storyNameHtml(s) + '</span>' +
-              (s.releaseName ? '<span class="story-release-tag">' + esc(s.releaseName) + '</span>' : '') + '</div>' +
+              (s.releaseName ? '<span class="story-release-tag">' + esc(s.releaseName) + '</span>' : '') +
+              (s.movedBack ? '<span class="moved-tag" title="Still deployed in ' + esc(s.movedBack.env) + ', though the story itself was moved back">Moved back to ' + esc(s.movedBack.now) + '</span>' : '') + '</div>' +
             branchHtml(s) +
-            prInfoHtml(s) +
+            movedBackHtml(s) +
+            '<div id="pri-' + row + '">' + prInfoHtml(s, comp) + '</div>' +
           '</div>' +
-          '<div class="story-actions">' + actions + '</div>' +
+          '<div class="story-actions" id="act-' + row + '">' + actionsHtml(row) + '</div>' +
         '</div>';
       }).join('');
 
@@ -1952,10 +2675,14 @@ export class ReleaseCheckerPanel {
       const tip = riskTip(risk, n, n - withPr);
       counts[risk]++;
       if (idx === 0 || components[idx - 1].type !== comp.type) {
-        navItems.push((idx ? '</div>' : '') + '<div class="nav-sec"><div class="nav-group"><span>' + esc(comp.type) + '</span><span class="nav-count">' + typeCount[comp.type] + '</span></div>');
+        const shut = _collapsedTypes.has(comp.type);
+        navItems.push((idx ? '</div>' : '') + '<div class="nav-sec' + (shut ? ' collapsed' : '') + '">' +
+          '<button type="button" class="nav-group" data-type="' + esc(comp.type) + '" aria-expanded="' + !shut + '" onclick="toggleType(this)" title="Show or hide ' + esc(comp.type) + ' components">' +
+            '<span class="nav-title"><svg class="chev" width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="2"/></svg>' + esc(comp.type) + '</span>' +
+            '<span class="nav-count">' + typeCount[comp.type] + '</span></button>');
       }
       navItems.push(
-        '<button type="button" class="component-header" data-idx="' + idx + '" data-key="' + esc(comp.type + '/' + comp.name) + '" onclick="toggleComponent(' + idx + ')" title="' + esc(comp.name) + ' · ' + tip + '">' +
+        '<button type="button" class="component-header" data-idx="' + idx + '" data-key="' + esc(comp.type + '/' + comp.name) + '" onclick="toggleComponent(' + idx + ', true)" title="' + esc(comp.name) + ' · ' + tip + '">' +
           '<span class="risk risk-' + risk + '"></span>' +
           '<span class="component-name">' + esc(comp.name) + '</span>' +
           '<span class="component-count">' + n + '</span>' +
@@ -2009,10 +2736,24 @@ export class ReleaseCheckerPanel {
         document.getElementById('modeCard').style.display = 'block';
         document.getElementById('orgDot').classList.add('on');
         _releases = msg.releases;
+        _pipelines = msg.pipelines || [];
+        if (!_pipelines.some(p => p.name === _pipelineName)) {
+          const active = _pipelines.filter(p => p.active);
+          _pipelineName = active.length === 1 ? active[0].name : '';
+        }
+        renderPipelines();
+        onPipelinePick((_pipelines.find(p => p.name === _pipelineName) || {}).id || '');
         _picked.promote = [];
         _picked.future = [];
         renderReleasePickers();
         showStatus('Loaded ' + msg.releases.length + ' releases. Select releases and click Analyse.', 'success', false);
+        break;
+      }
+      case 'pipelineEnvs': {
+        const cur = _pipelines.find(p => p.name === _pipelineName);
+        if (!cur || cur.id !== msg.pipelineId) break;
+        _environments = msg.environments || [];
+        renderEnvironments(false);
         break;
       }
       case 'results':
@@ -2020,7 +2761,9 @@ export class ReleaseCheckerPanel {
         _orgInstanceUrl = msg.orgInstanceUrl || _orgInstanceUrl;
         document.getElementById('btnAnalyseReleases').disabled = false;
         document.getElementById('btnAnalyseStories').disabled = false;
-        _last = { components: msg.components, mode: msg.mode };
+        _run++;
+        _touch.clear();
+        _last = { components: msg.components, mode: msg.mode, envName: msg.envName || '', envStoryCount: msg.envStoryCount || 0, envOwnCount: msg.envOwnCount || 0, movedBackCount: msg.movedBackCount || 0 };
         renderEnvOptions(msg.components);
         refreshPrefsState();
         renderResults(msg.components, msg.mode);
@@ -2029,6 +2772,15 @@ export class ReleaseCheckerPanel {
         } else {
           showStatus('Analysis complete — ' + msg.components.length + ' common components found. Expand each to view story diffs.', 'success', false);
         }
+        break;
+      case 'prTouch':
+        if (msg.run !== _run) break;
+        _touch.set(msg.key, { results: msg.results || {} });
+        refreshTouchRows(msg.key);
+        break;
+      case 'progress':
+        if (_awaitingReleases) break;
+        showProgress(msg);
         break;
       case 'status':
         showStatus(msg.message, 'info', msg.spinner !== false);
@@ -2058,6 +2810,9 @@ export class ReleaseCheckerPanel {
   applyTheme(currentTheme);
   renderEnvOptions([]);
   setPrSource(_prSource);
+  renderPipelines();
+  renderEnvironments(false);
+  setCompareBy(_compareBy);
   if (SAVED.mode === 'story') switchMode('story');
   refreshPrefsState();
   document.querySelector('.theme-toggle').addEventListener('click', e => {
@@ -2084,6 +2839,7 @@ export class ReleaseCheckerPanel {
   }
 
   public dispose(): void {
+    stopAllGit();
     ReleaseCheckerPanel.currentPanel = undefined;
     this.panel.dispose();
     for (const d of this.disposables) d.dispose();
