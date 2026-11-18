@@ -333,7 +333,18 @@ async function gitFetchRefspecsAsync(refspecs: string[], repoPath: string): Prom
     log(`git fetch failed on credentials, not retrying per ref: ${batch.err.trim().slice(0, 300)}`);
     return;
   }
-  // One missing ref fails the whole batch — retry individually so the rest still land.
+  // One missing ref (e.g. a deleted base branch) fails the whole batch. Ask GitHub which refs exist and fetch
+  // those in one go; refetching ~150 refs one by one at ~2 s each took minutes.
+  const srcOf = (spec: string) => spec.replace(/^\+/, '').split(':')[0];
+  const listed = await gitAsync(netArgs(repoPath, ['ls-remote', 'origin', ...new Set(refspecs.map(srcOf))]), repoPath, undefined, netEnv(repoPath));
+  if (gitStopped) return;
+  if (listed.ok) {
+    const existing = new Set(listed.out.split('\n').map(l => l.split('\t')[1]?.trim()).filter(Boolean));
+    const present = refspecs.filter(s => existing.has(srcOf(s)));
+    log(`git fetch: ${refspecs.length - present.length} ref(s) no longer on the remote: ${refspecs.filter(s => !existing.has(srcOf(s))).map(srcOf).join(', ').slice(0, 300)}`);
+    if (present.length === 0) return;
+    if ((await gitAsync(netArgs(repoPath, ['fetch', 'origin', ...present]), repoPath, undefined, netEnv(repoPath))).ok || gitStopped) return;
+  }
   for (const spec of refspecs) {
     if (gitStopped) return;
     await gitAsync(netArgs(repoPath, ['fetch', 'origin', spec]), repoPath, undefined, netEnv(repoPath));
@@ -421,6 +432,32 @@ async function commitsTouch(commits: string[], filePath: string, source: 'featur
   }
   return false;
 }
+
+// Every file the story commits change, so any number of components can be checked without more git calls.
+// null = could not be read.
+async function commitsFiles(commits: string[], source: 'feature' | 'promo', repoPath: string): Promise<Set<string> | null> {
+  const files = new Set<string>();
+  if (commits.length === 0) return files;
+  const add = (out: string) => out.split('\n').map(s => s.trim()).filter(Boolean).forEach(f => files.add(f));
+  if (source === 'feature') {
+    const r = await gitAsync(['-c', 'core.quotepath=off', 'log', '--no-walk', '--stdin', '--name-only', '--no-renames', '--diff-merges=dense-combined', '--format='], repoPath, commits.join('\n') + '\n');
+    if (!r.ok) return null;
+    add(r.out);
+    return files;
+  }
+  for (const c of commits) {
+    const r = await gitAsync(['-c', 'core.quotepath=off', 'diff', '--name-only', '--no-renames', `${c}^1`, c], repoPath);
+    if (!r.ok) return null;
+    add(r.out);
+  }
+  return files;
+}
+
+type TouchStory = { id: string; name: string; repoUrl: string; baseBranch: string; prs: PullRequest[] };
+type TouchJob = { key: string; componentName: string; componentType: string; stories: TouchStory[] };
+
+const touchesPath = (files: Set<string>, filePath: string): boolean =>
+  filePath.endsWith('/') ? [...files].some(f => f.startsWith(filePath)) : files.has(filePath);
 
 function byCommitTime(lines: string): string[] {
   return lines.trim().split('\n').filter(Boolean)
@@ -733,8 +770,11 @@ export class ReleaseCheckerPanel {
       case 'analyseEnv':
         await this.analyseAgainstEnv(msg.promoteIds as string[], String(msg.envId ?? ''), String(msg.envName ?? ''), String(msg.pipelineId ?? ''));
         break;
-      case 'checkPrTouch':
-        await this.checkPrTouch(msg);
+      case 'checkPrTouchAll':
+        await this.checkPrTouchAll(msg);
+        break;
+      case 'prTouchFirst':
+        this.prioritiseTouch(String(msg.key ?? ''));
         break;
       case 'analyseStories':
         await this.analyseStories(msg.story1 as string, msg.story2 as string);
@@ -1154,10 +1194,12 @@ export class ReleaseCheckerPanel {
   // opening diffs repeatedly does no repeated GitHub or git work.
   private fetched = new Map<string, Promise<void>>();
   private commitCache = new Map<string, Promise<StoryCommits>>();
+  private filesCache = new Map<string, Promise<Set<string> | null>>();
 
   private resetRunCaches(): void {
     this.fetched.clear();
     this.commitCache.clear();
+    this.filesCache.clear();
   }
 
   private async ensureFetched(repoPath: string, baseBranches: string[] | string, prs: PullRequest[]): Promise<void> {
@@ -1184,53 +1226,80 @@ export class ReleaseCheckerPanel {
     return job;
   }
 
-  // Which of each story's PRs change the component. A PR whose commits can't be read stays "unknown" so it
-  // is still offered; clicking it gives the real reason.
-  private async checkPrTouch(msg: Record<string, unknown>): Promise<void> {
-    try {
-      await this.runPrTouch(msg);
-    } catch (e) {
-      // Without a reply the rows would stay on "checking…"; an empty result offers every PR as before.
-      log(`PR check failed: ${String(e)}`);
-      this.post({ type: 'prTouch', key: msg.key, run: msg.run, results: {} });
-    }
+  // Each job carries its own batch's source, run and repos, since jobs from an earlier batch stay queued.
+  private touchQueue: Array<TouchJob & { source: 'feature' | 'promo'; run: unknown; repos: Map<string, Promise<string>> }> = [];
+
+  private prioritiseTouch(key: string): void {
+    const i = this.touchQueue.findIndex(j => j.key === key);
+    if (i > 0) this.touchQueue.unshift(...this.touchQueue.splice(i, 1));
   }
 
-  private async runPrTouch(msg: Record<string, unknown>): Promise<void> {
-    const source = msg.source === 'promo' ? 'promo' : 'feature';
-    const componentName = String(msg.componentName ?? '');
-    const componentType = String(msg.componentType ?? '');
-    const stories = (msg.stories as Array<{ id: string; name: string; repoUrl: string; baseBranch: string; prs: PullRequest[] }>) ?? [];
-    const filePath = touchPath(componentName, componentType);
-    const results: Record<string, { touching: number[]; unknown: number[] }> = {};
-    const started = Date.now();
+  // Files changed by one PR's story commits; computed once per run, then every component is a set lookup.
+  private prFiles(pr: PullRequest, storyName: string, baseBranch: string, source: 'feature' | 'promo', repoPath: string): Promise<Set<string> | null> {
+    const key = [source, repoPath, storyName, baseBranch, pr.number, pr.promotion ?? '', pr.targetBranch].join('|');
+    let job = this.filesCache.get(key);
+    if (!job) {
+      job = this.storyCommits(pr, storyName, baseBranch, source, repoPath).then(res =>
+        // A fallback to plain story commits (no promotion merge found) is judged like a feature PR.
+        'error' in res ? null : commitsFiles(res.commits, res.note ? 'feature' : source, repoPath));
+      this.filesCache.set(key, job);
+    }
+    return job;
+  }
 
-    const byRepo = new Map<string, typeof stories>();
-    for (const s of stories) {
-      const repo = s.repoUrl || repoUrlFrom(s.prs.find(p => p.url)?.url ?? '');
-      byRepo.set(repo, [...(byRepo.get(repo) ?? []), s]);
+  // Which of each story's PRs change each component, for every component of the results at once. One fetch
+  // covers all PRs; results go back per component as they are ready, in the order sent (selected first).
+  // A PR whose commits can't be read stays "unknown" so it is still offered; clicking it gives the reason.
+  private async checkPrTouchAll(msg: Record<string, unknown>): Promise<void> {
+    const source: 'feature' | 'promo' = msg.source === 'promo' ? 'promo' : 'feature';
+    const jobs = (msg.jobs as TouchJob[]) ?? [];
+    const run = msg.run;
+    const started = Date.now();
+    const repoOf = (s: TouchStory) => s.repoUrl || repoUrlFrom(s.prs.find(p => p.url)?.url ?? '');
+
+    // Resolve and fetch each repo once for the whole batch.
+    const repos = new Map<string, Promise<string>>();
+    const byRepo = new Map<string, TouchStory[]>();
+    for (const s of jobs.flatMap(j => j.stories)) byRepo.set(repoOf(s), [...(byRepo.get(repoOf(s)) ?? []), s]);
+    for (const [repo, list] of byRepo) {
+      repos.set(repo, (async () => {
+        let repoPath = '';
+        try { repoPath = await this.resolveRepoPath(repo); } catch (e) { log(`PR check: ${String(e)}`); return ''; }
+        const prs = new Map<number, PullRequest>();
+        list.forEach(s => splitByRepo(repo, s.prs).prs.forEach(p => prs.set(p.number, p)));
+        await this.ensureFetched(repoPath, [...new Set(list.map(s => s.baseBranch))], [...prs.values()]);
+        return repoPath;
+      })());
     }
 
-    await Promise.all([...byRepo].map(async ([repo, list]) => {
-      let repoPath = '';
-      try { repoPath = await this.resolveRepoPath(repo); } catch (e) { log(`PR check: ${String(e)}`); }
-      const inRepo = list.map(s => ({ s, split: splitByRepo(repo, s.prs) }));
-      if (repoPath) await this.ensureFetched(repoPath, list.map(s => s.baseBranch), inRepo.flatMap(x => x.split.prs));
-      await Promise.all(inRepo.map(async ({ s, split }) => {
-        const r = results[s.id] = { touching: [] as number[], unknown: s.prs.filter(p => !split.prs.includes(p)).map(p => p.number) };
-        await Promise.all(split.prs.map(async pr => {
-          if (!repoPath) { r.unknown.push(pr.number); return; }
-          const res = await this.storyCommits(pr, s.name, s.baseBranch, source, repoPath);
-          if ('error' in res) { r.unknown.push(pr.number); return; }
-          // A fallback to plain story commits (no promotion merge found) is judged like a feature PR.
-          if (await commitsTouch(res.commits, filePath, res.note ? 'feature' : source, repoPath)) r.touching.push(pr.number);
+    // A component the user opens while the batch runs jumps the queue (see 'prTouchFirst'). The jobs of an
+    // earlier batch that hasn't finished stay queued behind this one, so their rows never stay on "checking…".
+    const queue = [...jobs.map(j => ({ ...j, source, run, repos })), ...this.touchQueue];
+    this.touchQueue = queue;
+    while (queue.length) {
+      if (gitStopped || this.touchQueue !== queue) return;
+      const job = queue.shift()!;
+      const results: Record<string, { touching: number[]; unknown: number[] }> = {};
+      try {
+        const filePath = touchPath(job.componentName, job.componentType);
+        await Promise.all(job.stories.map(async s => {
+          const repo = repoOf(s);
+          const split = splitByRepo(repo, s.prs);
+          const r = results[s.id] = { touching: [] as number[], unknown: s.prs.filter(p => !split.prs.includes(p)).map(p => p.number) };
+          const repoPath = await job.repos.get(repo);
+          await Promise.all(split.prs.map(async pr => {
+            const files = repoPath ? await this.prFiles(pr, s.name, s.baseBranch, job.source, repoPath) : null;
+            if (!files) r.unknown.push(pr.number);
+            else if (touchesPath(files, filePath)) r.touching.push(pr.number);
+          }));
         }));
-      }));
-    }));
-
-    log(`PR check ${componentType} ${componentName} (${source}) in ${Date.now() - started} ms: ` +
-      Object.entries(results).map(([id, r]) => `${stories.find(s => s.id === id)?.name}: touching [${r.touching.join(',')}] unknown [${r.unknown.join(',')}]`).join('; '));
-    this.post({ type: 'prTouch', key: msg.key, run: msg.run, results });
+      } catch (e) {
+        // Without a reply the rows would stay on "checking…"; an empty result offers every PR.
+        log(`PR check failed for ${job.componentType} ${job.componentName}: ${String(e)}`);
+      }
+      this.post({ type: 'prTouch', key: job.key, run: job.run, results });
+    }
+    log(`PR check (${source}) of ${jobs.length} components in ${Date.now() - started} ms`);
   }
 
   private async openPrDiff(
@@ -1854,7 +1923,7 @@ export class ReleaseCheckerPanel {
   .pr-pill,.story-release-tag,.moved-tag{border-radius:6px}
   .pr-pill.pr-skip{opacity:.45;text-decoration:line-through}
   .story-touch{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
-  .touch-spin{width:10px;height:10px;border:2px solid color-mix(in srgb, var(--muted) 35%, transparent);border-top-color:var(--muted);border-radius:50%;animation:spin .8s linear infinite;flex:none}
+  .touch-spin{--amb:var(--pick-future, var(--vscode-charts-yellow, #c27c0e));width:10px;height:10px;border:2px solid color-mix(in srgb, var(--amb) 30%, transparent);border-top-color:var(--amb);border-radius:50%;animation:spin .8s linear infinite;flex:none}
   .moved-tag{font-size:11px;color:var(--warn);border:1px dashed color-mix(in srgb, var(--warn) 55%, transparent);padding:0 7px}
   .kpi-env{grid-column:span 2;display:flex;flex-direction:column;gap:2px;min-width:0}
   .kpi-env .ec-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
@@ -2082,15 +2151,22 @@ export class ReleaseCheckerPanel {
     return !t ? prs : prs.filter(p => t.touching.has(p.number) || t.unknown.has(p.number));
   };
 
-  function requestTouch(comp) {
-    if (!comp) return;
-    const key = touchKey(comp);
-    if (_touch.has(key)) return;
-    const stories = comp.excludeStories.filter(s => !lookupFailed(s) && prsOf(s).length)
-      .map(s => ({ id: s.id, name: s.name, repoUrl: s.repoUrl || '', baseBranch: s.baseBranch, prs: prsOf(s) }));
-    if (!stories.length) { _touch.set(key, { results: {} }); return; }
-    _touch.set(key, { pending: true });
-    vscode.postMessage({ command: 'checkPrTouch', key, run: _run, source: _prSource, componentName: comp.name, componentType: comp.type, stories });
+  // Checks every component of the results for the current PR source / environment in one batch, the
+  // selected one first, so switching between components needs no waiting.
+  function requestAllTouch(first) {
+    const order = first ? [first, ..._comps.filter(c => c !== first)] : _comps;
+    if (first && _touch.get(touchKey(first))?.pending) vscode.postMessage({ command: 'prTouchFirst', key: touchKey(first) });
+    const jobs = [];
+    for (const comp of order) {
+      const key = touchKey(comp);
+      if (_touch.has(key)) continue;
+      const stories = comp.excludeStories.filter(s => !lookupFailed(s) && prsOf(s).length)
+        .map(s => ({ id: s.id, name: s.name, repoUrl: s.repoUrl || '', baseBranch: s.baseBranch, prs: prsOf(s) }));
+      if (!stories.length) { _touch.set(key, { results: {} }); continue; }
+      _touch.set(key, { pending: true });
+      jobs.push({ key, componentName: comp.name, componentType: comp.type, stories });
+    }
+    if (jobs.length) vscode.postMessage({ command: 'checkPrTouchAll', run: _run, source: _prSource, jobs });
   }
 
   function refreshTouchRows(key) {
@@ -2296,7 +2372,7 @@ export class ReleaseCheckerPanel {
     const open = btn.textContent === 'Expand all';
     if (open) {
       document.querySelectorAll('.component-stories').forEach(el => el.classList.add('open'));
-      _comps.forEach(requestTouch);
+      requestAllTouch();
     }
     else toggleComponent(_selected);
     btn.textContent = open ? 'Collapse all' : 'Expand all';
@@ -2351,7 +2427,7 @@ export class ReleaseCheckerPanel {
     if (hdr) _selectedKey = hdr.dataset.key;
     document.querySelectorAll('.component-stories').forEach(el => el.classList.toggle('open', el.id === 'stories-' + id));
     document.querySelectorAll('.component-header').forEach(el => el.classList.toggle('on', el.dataset.idx === String(id)));
-    requestTouch(_comps[id]);
+    requestAllTouch(_comps[id]);
     const btn = document.getElementById('btnToggleAll');
     if (btn) btn.textContent = 'Expand all';
     // Picking an item low in a long list leaves the page scrolled past the detail, so go back to the top.
